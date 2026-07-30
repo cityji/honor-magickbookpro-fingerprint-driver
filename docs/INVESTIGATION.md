@@ -2072,3 +2072,72 @@ to `yes` several seconds *after* the greeter was already up, and back to `no`
 before the session was fully restored, so polling it is not a sound way to detect
 either edge. `run-lock-test.sh` no longer treats a missing `yes` as "the lock did
 not happen".
+
+
+---
+
+## 20. Published
+
+Session of 2026-07-30. The working driver, the patch set and this document are
+now a public repository:
+
+**https://github.com/cityji/honor-magickbookpro-fingerprint-driver**
+
+What went in, and what deliberately did not:
+
+| | |
+|---|---|
+| `patches/` | the seven shipped patches |
+| `patches-debug/` | `0003`, `0007`, `0008` — the instrumentation, and the retired experiment |
+| `build.sh` / `install.sh` / `uninstall.sh` | unchanged in behaviour; `install.sh` now takes the blob from `blob/` |
+| `get-blob.sh` | **new** — fetches `libfpcbep.so` from Lenovo's public download and checks its md5 |
+| `bootstrap.sh` | **new** — deps + blob + build + install in one command, for a fresh machine |
+| `docs/INVESTIGATION.md` | this file, with the local username scrubbed |
+| `docs/DEVICE.md` | hardware, protocol and a checklist for identifying other FPC MoH variants |
+| `docs/TROUBLESHOOTING.md` | |
+| `tools/` | the test harness, plus `probe-blob.c` |
+| **not** `libfpcbep.so` | proprietary, not redistributable |
+| **not** the usbmon captures or fprintd journals | they contain the encrypted fingerprint images and the username |
+| **not** the vendor Windows packages | copyrighted, and never used at runtime |
+
+The scratch directory (`~/Desktop/temp`, 126 MB) was left intact. The repository
+is a curated copy, not a move.
+
+### 20.1 The blob is fetchable, which makes a fresh install one command
+
+Worth recording because section 12 did not establish it: the `libfpcbep.so` in
+Lenovo's public package is **byte-identical** to the one this project has been
+using all along.
+
+```
+$ curl -sSL -o r1slm01w.zip https://download.lenovo.com/pccbbs/mobiles/r1slm01w.zip   # 4.7 MB
+$ unzip -p r1slm01w.zip FPC_driver_linux_27.26.23.39/install_fpc/libfpcbep.so | md5sum
+f7136fd774d5208e629bbeaa4974543a
+```
+
+So nothing proprietary has to be redistributed for someone else to install this,
+and `get-blob.sh` verifies the md5 that `patches/0009`'s offsets are pinned to.
+
+### 20.2 CI builds without the blob, by stubbing it
+
+Merge request 396 links `libfpcbep.so` directly (`DT_NEEDED`), so a build needs it
+resolvable at link time — which CI cannot have. `build.sh STUB_BLOB=1` handles it:
+compile everything, let the link fail, read the undefined `fpc_*` symbols straight
+out of the driver's object file, generate a shared library defining them, link
+again. `DT_NEEDED` still records the plain name `libfpcbep.so`, so the artifact
+loads the real matcher at run time.
+
+The obvious shortcut — parsing `fpclib_api.h` for declarations — does not work:
+`fpc_enclave_t *fpc_create_enclave (void)` yields the *return type* as the first
+`fpc_*` token, so `fpc_create_enclave`, `fpc_tee_init` and `fpc_tee_bio_init` come
+out undefined and the link still fails. Harvest from the object file, not the
+header.
+
+`.github/workflows/ci.yml` also asserts that the fixes are actually *compiled in*,
+by looking for format strings from 0006, 0009 and 0010 in the artifact — the check
+that would have caught the two wasted rounds recorded in section 16.
+
+### 20.3 The repository's own build was verified on hardware
+
+Not assumed. `get-blob.sh` → `build.sh` → `install.sh` from a clean checkout, then
+one press: `Verify result: verify-match (done)`.
