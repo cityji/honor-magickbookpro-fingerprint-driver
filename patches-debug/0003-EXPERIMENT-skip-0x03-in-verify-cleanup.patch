@@ -1,0 +1,53 @@
+EXPERIMENT (not a proposed fix): skip bRequest 0x03 in verify cleanup
+
+This patch exists to answer one question and should not be shipped without
+the answer. Apply it on top of 0002.
+
+After a capture, the a900 stops answering bRequest 0x03, the host cancels the
+control transfer after 1 s, and ~80 ms later the sensor DISCONNECTS from the
+USB bus and re-enumerates (FINDINGS.md 13.9). Three hypotheses for the
+trigger, which the existing traces cannot separate because every run cancels
+at exactly the same offset:
+
+  H1  the device resets itself on its own timer after a capture
+  H2  the host's cancellation of the in-flight EP0 transfer triggers it
+  H3  the capture's bulk traffic does, via the device's non-compliant
+      high-speed endpoint descriptor (wMaxPacketSize 64, must be 512)
+
+Removing the transfer entirely resolves all three at once, because then no
+command is sent and nothing is cancelled:
+
+  - no disconnect            -> 0x03-post-capture is the trigger (H1 via 0x03,
+                                or H2); enrollment may now proceed
+  - disconnect still at
+    ~+1080 ms after the last
+    image record              -> the capture itself resets the device (H3, or
+                                H1 on its own timer). A complete negative
+                                result.
+
+This is safe: it sends strictly FEWER commands to the device than the current
+code, and no new or speculative ones.
+
+Note this removes 0x03 only from the verify/identify cleanup state. Init's
+0x03 call site is untouched and still runs -- it is acknowledged in ~2 ms
+there and is presumably required.
+
+The shape is not invented: FP_ENROLL_DISCARD, which is the enroll SSM's
+cleanup state, already does exactly this and nothing else.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -987,9 +987,10 @@
+ 
+     case FP_VERIFY_CANCEL:
+       {
+-        /* Cleanup state -- see fpc_verify_cleanup_cb. A device that declines
+-         * to answer this must not sink an operation that already succeeded. */
+-        fpc_write_ctrl (ssm, device, 0x03, 0x01, NULL, 0, fpc_verify_cleanup_cb, NULL);
++        /* EXPERIMENT (patches/0003): do not send 0x03 from cleanup at all.
++         * Mirrors FP_ENROLL_DISCARD, which is the enroll SSM's cleanup state
++         * and already does exactly this. See FINDINGS.md 13.10. */
++        fpi_ssm_next_state (ssm);
+       }
+       break;
+     }

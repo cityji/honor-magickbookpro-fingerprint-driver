@@ -1,0 +1,34 @@
+fpcmoh: add support for FPC 10a5:a900 (Honor MagicBook)
+
+The a900 is an FPC "Disum" match-on-host sensor, firmware 22.26.2.29. It is
+the same protocol family as the already-supported 9800: one bulk IN endpoint
+(0x82), all host->device traffic on EP0 as vendor control transfers, and a
+TLS-PSK session whose PSK identity on the wire is literally "Disum PSK".
+libfpcbep.so's key material handshakes with it unmodified.
+
+Both entries are kept -- this adds the a900, it does not replace the 9800.
+
+The probe switch gains a matching case purely so the device does not log
+"Device a900 is not supported". Both arms set max_enroll_stage to the same
+value, so this is cosmetic; probe completed successfully either way.
+
+Applies on top of merge request 396.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -38,6 +38,7 @@
+ 
+ static const FpIdEntry id_table[] = {
+   { .vid = 0x10A5,  .pid = 0x9800,  },
++  { .vid = 0x10A5,  .pid = 0xA900,  },   /* Honor MagicBook, FPC "Disum", FW 22.26.2.29 */
+   { .vid = 0,  .pid = 0,  .driver_data = 0 },   /* terminating entry */
+ };
+ 
+@@ -1458,6 +1459,7 @@
+   switch (productid)
+     {
+     case 0x9800:
++    case 0xA900:
+       self->max_enroll_stage = MAX_ENROLL_SAMPLES;
+       break;
+ 

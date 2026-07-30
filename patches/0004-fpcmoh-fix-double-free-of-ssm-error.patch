@@ -1,0 +1,83 @@
+fpcmoh: fix double free of the SSM error (crashes fprintd with SIGSEGV)
+
+Both SSM completion callbacks overwrite their owned `error` parameter with a
+borrowed pointer to the SSM's own error, then hand that borrowed pointer to a
+(transfer full) function. The result is a leak plus a double free, and fprintd
+dies with SIGSEGV on every failed enroll/verify/identify:
+
+    fprintd.service: Main process exited, code=dumped, status=11/SEGV
+    fprintd.service: Failed with result 'core-dump'.
+
+libfprint gives the callback its own COPY of the error and keeps the original
+(libfprint/fpi-ssm.c, fpi_ssm_mark_completed):
+
+    if (machine->callback)
+      {
+        GError *error = machine->error ? g_error_copy (machine->error) : NULL;
+        machine->callback (machine, machine->dev, error);
+      }
+    fpi_ssm_free (machine);
+
+and fpi_ssm_free() then frees the original:
+
+    g_clear_pointer (&machine->error, g_error_free);
+
+while fpi_ssm_get_error() hands out a borrowed reference to that same original:
+
+    return machine->error;
+
+So in fpc_enroll_ssm_done()/fpc_verify_ssm_done():
+
+    if (fpi_ssm_get_error (ssm))
+      error = fpi_ssm_get_error (ssm);     /* leaks the copy we were given,   */
+                                           /* and adopts machine->error       */
+    fpi_device_enroll_complete (dev, NULL, error);   /* (transfer full): frees */
+                                                     /* machine->error         */
+    /* ... then fpi_ssm_free() frees machine->error again -> boom */
+
+fpi_device_enroll_complete() and fpi_device_identify_complete() are both
+annotated "@error: (transfer full)".
+
+The `error` parameter already carries exactly the value these two lines were
+trying to fetch, so the fix is simply to drop the override.
+
+Observed on FPC 10a5:a900. The identify path had never reached this code with a
+non-NULL error before -- it always failed earlier, in the FP_VERIFY_CANCEL
+cleanup state (see patch 0002) -- which is why the crash only appeared once that
+was fixed and an enroll got far enough to fail on its own.
+
+This is not a900-specific and not related to that device's firmware quirks: any
+FPC MoH device crashes fprintd whenever one of these state machines fails.
+
+Applies on top of merge request 396.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -953,9 +953,10 @@
+
+   fp_info ("Verify_identify complete!");
+
+-  if (fpi_ssm_get_error (ssm))
+-    error = fpi_ssm_get_error (ssm);
+-
++  /* NB: do not overwrite `error` with fpi_ssm_get_error(). libfprint already
++   * passed us an owned copy of the SSM error; fpi_ssm_get_error() returns the
++   * SSM's original, which fpi_ssm_free() frees. Adopting it here would leak the
++   * copy and then double-free the original via the (transfer full) complete(). */
+   if (error && error->domain == FP_DEVICE_RETRY)
+     {
+       if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
+@@ -1637,9 +1638,10 @@
+
+   self->enroll_ssm = NULL;
+
+-  if (fpi_ssm_get_error (ssm))
+-    error = fpi_ssm_get_error (ssm);
+-
++  /* NB: do not overwrite `error` with fpi_ssm_get_error(). libfprint already
++   * passed us an owned copy of the SSM error; fpi_ssm_get_error() returns the
++   * SSM's original, which fpi_ssm_free() frees. Adopting it here would leak the
++   * copy and then double-free the original via the (transfer full) complete(). */
+   if (error)
+     {
+       fpi_device_enroll_complete (dev, NULL, error);

@@ -1,0 +1,196 @@
+fpcmoh: let the matcher decide whether a sample was any good
+
+fpc_read_dead_pixels() called fpc_tee_enroll() and threw the result away, then
+called fpi_device_enroll_progress() unconditionally. Two consequences, both
+observed on the a900:
+
+ - An enrollment in which the matcher rejected every single sample still reported
+   eleven enroll-stage-passed and enroll-completed, and fprintd stored a template
+   built from no image at all. This is why the underlying fault took so long to
+   find: nothing in the driver, the daemon or the UI said anything was wrong. It
+   would hide the same way on any FPC MoH device.
+
+ - The sample count came from the driver. MAX_ENROLL_SAMPLES is 11, but this
+   sensor's matcher reports "remaining 16" and it means it: enrollment ended five
+   samples early, and fpc_tee_end_enroll() returned -1 with a 92 byte template.
+   That return value was also discarded, so the useless template was stored.
+
+So act on what the matcher says:
+
+ - PROGRESS / COMPLETED -- count the sample and report the stage. Stop when the
+   matcher says COMPLETED, or when it stops asking for more samples; the stage
+   count is only a backstop now.
+ - LOW_COVERAGE / TOO_SIMILAR / LOW_QUALITY -- do not advance the stage. Report a
+   retry through fpi_device_enroll_progress() so the user is asked for the finger
+   again, which is what libfprint's retry errors are for. Give up after
+   FPC_MAX_ENROLL_REJECTS rejections rather than asking forever.
+ - ALREADY_ENROLED -- FP_DEVICE_ERROR_DATA_DUPLICATE.
+ - anything else -- fail the state machine instead of continuing.
+ - fpc_tee_end_enroll() failing now fails the enrollment. Storing a template the
+   matcher did not build only produces a print that never verifies.
+
+nr_enroll_stages for the a900 becomes 16, which is what its matcher asks for.
+The 9800 keeps 11.
+
+Applies on top of merge request 396 and patches 0001-0006, 0009.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.h
++++ b/libfprint/drivers/fpcmoh/fpc.h
+@@ -69,6 +69,16 @@
+ 
+ #define FP_COMPONENT "fpcmoh"
+ #define MAX_ENROLL_SAMPLES (11)
++
++/* patches/0010: the a900's matcher asks for sixteen samples, not eleven -- it
++ * reports how many it still wants after each one, and the driver now follows
++ * that rather than a fixed count. This is the backstop, and the number of
++ * stages fprintd is told to expect. */
++#define MAX_ENROLL_SAMPLES_A900 (16)
++
++/* How many samples the matcher may reject before enrollment is abandoned. */
++#define FPC_MAX_ENROLL_REJECTS (24)
++
+ #define CTRL_TIMEOUT (1000)
+ #define DATA_TIMEOUT (5000)
+ 
+@@ -343,4 +353,7 @@
+   /* patches/0009: this sensor's image message has a 24 byte prefix where the
+    * host matcher expects 34. See fpc_img_msg_relayout(). */
+   gboolean        relayout_img_msg;
++
++  /* patches/0010: samples the matcher refused during this enrollment. */
++  guint32         enroll_rejects;
+ };
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -606,6 +606,23 @@
+   fpi_ssm_next_state (transfer->ssm);
+ }
+ 
++/* patches/0010: what to tell the user about a sample the matcher would not take. */
++static GError *
++fpc_enroll_retry_error (gint result)
++{
++  switch (result)
++    {
++    case FPC_ENROL_STATUS_IMAGE_LOW_COVERAGE:
++      return fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER);
++
++    case FPC_ENROL_STATUS_IMAGE_TOO_SIMILAR:
++      return fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER);
++
++    default:
++      return fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
++    }
++}
++
+ static void
+ fpc_read_dead_pixels (FpiUsbTransfer *transfer, FpDevice *device,
+                       gpointer unused_data, GError *error)
+@@ -664,10 +681,68 @@
+       expect_len = 0;
+       fpc_process_data (self, "dead pixel");
+ 
+-      if (self->enroll_count++ < MAX_ENROLL_SAMPLES)
++      gboolean done;
++
++      remaining_samples = 0;
++      result = fpc_tee_enroll (self->dev_ctx->bio, &remaining_samples);
++      fp_dbg ("%s: fpc_tee_enroll -> %d, remaining %u (%u accepted, %u rejected)",
++              G_STRFUNC, result, remaining_samples, self->enroll_count,
++              self->enroll_rejects);
++
++      switch (result)
++        {
++        case FPC_ENROL_STATUS_COMPLETED:
++        case FPC_ENROL_STATUS_PROGRESS:
++          self->enroll_count++;
++          fpi_device_enroll_progress (device,
++                                      MIN (self->enroll_count,
++                                           (guint32) self->max_enroll_stage),
++                                      NULL, NULL);
++          /* The matcher decides when it has enough samples, not the driver: it
++           * says so outright with COMPLETED, or by asking for none more. The
++           * stage count is only a backstop. */
++          done = (result == FPC_ENROL_STATUS_COMPLETED) ||
++                 (remaining_samples == 0) ||
++                 (self->enroll_count >= (guint32) self->max_enroll_stage);
++          break;
++
++        case FPC_ENROL_STATUS_IMAGE_LOW_COVERAGE:
++        case FPC_ENROL_STATUS_IMAGE_TOO_SIMILAR:
++        case FPC_ENROL_STATUS_IMAGE_LOW_QUALITY:
++          /* A rejected sample is neither progress nor a failure: ask for the
++           * finger again without advancing the stage. The driver used to ignore
++           * this result entirely and report every rejected sample as a passed
++           * stage, so an enrollment in which the matcher accepted nothing at all
++           * still reported enroll-completed and stored an empty template. */
++          done = FALSE;
++          fpi_device_enroll_progress (device, self->enroll_count, NULL,
++                                      fpc_enroll_retry_error (result));
++
++          if (++self->enroll_rejects > FPC_MAX_ENROLL_REJECTS)
++            {
++              fp_err ("%s: matcher rejected %u samples in a row, giving up",
++                      G_STRFUNC, self->enroll_rejects);
++              fpi_ssm_mark_failed (transfer->ssm,
++                                   fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++              return;
++            }
++          break;
++
++        case FPC_ENROL_STATUS_FAILED_ALREADY_ENROLED:
++          fp_err ("%s: this finger is already enrolled", G_STRFUNC);
++          fpi_ssm_mark_failed (transfer->ssm,
++                               fpi_device_error_new (FP_DEVICE_ERROR_DATA_DUPLICATE));
++          return;
++
++        default:
++          fp_err ("%s: fpc_tee_enroll failed: %d", G_STRFUNC, result);
++          fpi_ssm_mark_failed (transfer->ssm,
++                               fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++          return;
++        }
++
++      if (!done)
+         {
+-          result = fpc_tee_enroll (self->dev_ctx->bio, &remaining_samples);
+-          fpi_device_enroll_progress (device, self->enroll_count, NULL, NULL);
+           /* patches/0005: go via the FP_ENROLL_X_* recovery states rather than
+            * straight to FP_ENROLL_CAPTURE, so whatever clears the post-capture
+            * wedge runs before every sample and not only the first. */
+@@ -677,6 +752,16 @@
+         {
+           result = fpc_tee_end_enroll (self->dev_ctx->bio, &g_finger_id);
+           fp_dbg ("%s: fpc_tee_end_enroll result %d, fingerid %u", G_STRFUNC, result, g_finger_id);
++
++          if (result != 0)
++            {
++              fp_err ("%s: fpc_tee_end_enroll failed: %d -- refusing to store a "
++                      "template the matcher did not build", G_STRFUNC, result);
++              fpi_ssm_mark_failed (transfer->ssm,
++                                   fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++              return;
++            }
++
+           fpi_ssm_next_state (transfer->ssm);
+         }
+     }
+@@ -996,6 +1081,7 @@
+     case FP_ENROLL_BEGIN:
+       {
+         self->enroll_count = 0;
++        self->enroll_rejects = 0;
+         result = fpc_tee_load_empty_db (self->dev_ctx->bio);
+         if (result)
+           {
+@@ -2123,7 +2209,8 @@
+       break;
+ 
+     case 0xA900:
+-      self->max_enroll_stage = MAX_ENROLL_SAMPLES;
++      /* patches/0010: this sensor's matcher wants sixteen samples. */
++      self->max_enroll_stage = MAX_ENROLL_SAMPLES_A900;
+       /* patches/0006: sends three more records per capture than the eleven
+        * fixed read states consume. */
+       self->read_remaining = TRUE;

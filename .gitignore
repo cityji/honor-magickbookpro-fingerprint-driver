@@ -1,0 +1,21 @@
+# Build tree and artifacts
+build/
+dist/
+
+# The proprietary matcher is fetched by ./get-blob.sh and must never be
+# committed -- it is not redistributable.
+blob/
+*.so
+*.so.*
+
+# Test output: usbmon captures and fprintd journals contain the encrypted
+# fingerprint images and your username. Never commit these.
+usbmon-*.txt
+fprintd-*.log
+enroll-*.log
+verify-*.log
+lock-*.log
+
+# Local scratch
+*.o
+probe

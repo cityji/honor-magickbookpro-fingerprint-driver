@@ -1,0 +1,279 @@
+fpcmoh: fix up the a900's image message for the host matcher
+
+This is what stopped the login working. The image was reaching the host intact
+and being rejected before the algorithm ever ran, because the sensor and the
+matcher disagree about the image message header by ten bytes.
+
+fpc_enclave_process_data() reassembles one application message across however
+many TLS records it takes, and dispatches when it is complete:
+
+    img_len = recv_len - 0xa - 0x18;               /* 34 byte prefix, hardcoded */
+    if (img_len != fpc_bep_image_get_size (img))
+      return -1;
+    ...
+    memcpy (pixels, msgbuf + 0x22, img_size);      /* pixel source +34, hardcoded */
+
+The a900 declares total = 11288 for its 64 x 176 sensor: a 24 byte prefix and
+11264 pixel bytes. libfpcbep.so wants 34, computes 11288 - 34 = 11254, compares
+that against 11264 and returns -1. The driver discarded that return value, so
+every sample came back IMAGE_LOW_QUALITY from an algorithm that had never been
+handed an image, "remaining" never moved off 16, and enrollment reported eleven
+passed stages and stored a template built from nothing.
+
+Nothing else about the blob is wrong for this sensor -- measured against it:
+
+    fpc_hw_get_sensor_details_for_hardware_id(0x331) -> type 7, w 64, h 176
+    fpc_enclave_init(enclave, 0x331)                 -> 0
+    fpc_bep_image_get_size(image)                    -> 11264 == 64 * 176
+
+and the metadata the enclave reads sits at 0x0c..0x15, inside the first 22 bytes,
+so it is correctly placed in both layouts. Only the gap between the metadata and
+the pixels differs: the a900 sends two bytes there, the blob expects twelve.
+
+The message is TLS between the sensor's firmware and the blob's own mbedtls, so
+the driver cannot change it on the wire. It can move it once it has landed: after
+the first record, open a ten byte gap at offset 24 and tell the blob the message
+is ten bytes longer. Later records then land correctly by themselves, because the
+blob appends at dst + recv_len. What the blob finally sees is the layout it was
+built for.
+
+Offsets into libfpcbep.so come from its disassembly and are pinned to the build
+installed here (md5 f7136fd774d5208e629bbeaa4974543a). They are checked before
+use, not trusted: the TLS state word must read 16, the blob's own destination
+pointer must be the buffer we think it is, and the declared length must be
+exactly this sensor's image plus 24. If any of that fails this does nothing and
+the driver behaves exactly as it did before.
+
+Enabled only for 10a5:a900. The 9800 is untouched.
+
+Not upstreamable, and not offered as such: reaching into another library's
+private state is the price of a closed matcher. The clean fixes are a blob built
+for this message format, or a sensor that sends the format this blob was built
+for. This also fixes a real driver bug on the way -- fpc_enclave_process_data()'s
+return value is no longer discarded.
+
+Applies on top of merge request 396 and patches 0001-0006.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.h
++++ b/libfprint/drivers/fpcmoh/fpc.h
+@@ -339,4 +339,8 @@
+   guint32         rem_expect_len;
+   guint32         rem_received_len;
+   guint           rem_reads;
++
++  /* patches/0009: this sensor's image message has a 24 byte prefix where the
++   * host matcher expects 34. See fpc_img_msg_relayout(). */
++  gboolean        relayout_img_msg;
+ };
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -19,9 +19,173 @@
+ #include "drivers_api.h"
+ #include "fpc.h"
+ #include <byteswap.h>
++#include <dlfcn.h>
+ 
+ G_DEFINE_TYPE (FpiDeviceFpcMoh, fpi_device_fpcmoh, FP_TYPE_DEVICE);
+ 
++/* ---------------------------------------------------------------------------
++ * patches/0009: the a900's image message has a 24 byte prefix, libfpcbep.so
++ * expects 34.
++ *
++ * fpc_enclave_process_data() reassembles one application message out of however
++ * many TLS records it takes, in file-static state inside the blob, and only when
++ * the message is complete does it hand the pixels to the algorithm:
++ *
++ *     if (recv_len == 0)                          // first record of a message
++ *       {
++ *         n     = mbedtls_ssl_read (ssl, buf, 0x800);
++ *         type  = be32 (buf + 0);                 // 8 = FPC_EVT_IMG
++ *         total = be32 (buf + 4);                 // whole message, header included
++ *         dst   = (type == 8) ? msgbuf : deadpixbuf;
++ *         memcpy (dst, buf, n); recv_len = n;
++ *       }
++ *     else
++ *       recv_len += mbedtls_ssl_read (ssl, dst + recv_len, total - recv_len);
++ *
++ *     if (recv_len < total) return 0;
++ *     if (recv_len > total) return -6;
++ *
++ *     img_len = recv_len - 0xa - 0x18;             // 34 byte prefix, hardcoded
++ *     if (img_len != fpc_bep_image_get_size (img))
++ *       return -1;
++ *     ... metadata from msgbuf + 0x0c .. 0x15 ...
++ *     memcpy (pixels, msgbuf + 0x22, img_size);    // pixel source +34, hardcoded
++ *
++ * The a900 declares total = 11288 for a 64 x 176 sensor, so 11288 - 11264 = 24
++ * bytes of prefix: the twelve byte event header, ten bytes of metadata at
++ * 0x0c..0x15, and two more. The blob wants twelve more there, computes
++ * 11288 - 34 = 11254, compares it against 11264 and returns -1 -- so the
++ * algorithm never sees the image at all, every sample comes back
++ * IMAGE_LOW_QUALITY and "remaining" never moves. Ten bytes.
++ *
++ * The message is TLS between the sensor's firmware and the blob's own mbedtls,
++ * so the driver cannot alter it on the wire. It can move it afterwards: once the
++ * first record has landed, open a ten byte gap between the metadata and the
++ * pixels and tell the blob the message is ten bytes longer. Subsequent records
++ * then land at the right offsets on their own, because the blob appends at
++ * dst + recv_len. The result is the layout the blob was built for -- metadata
++ * still at 0x0c..0x15, pixels at 0x22, img_len == 11264 -- with ten bytes of
++ * ignored padding in between (nothing reads 0x16..0x21).
++ *
++ * Offsets into libfpcbep.so come from its disassembly and are pinned to the
++ * build installed here, md5 f7136fd774d5208e629bbeaa4974543a. They are checked
++ * before use rather than trusted: the TLS state word must read 16, the blob's
++ * own destination pointer must be the message buffer we think it is, and the
++ * declared length must be exactly this sensor's image plus 24. If any of that
++ * does not hold this does nothing at all, and the driver behaves as it did
++ * before. Not upstreamable, and not meant to be -- reaching into another
++ * library's private state is the price of a closed matcher. The clean fixes are
++ * a blob built for this message format, or a sensor that sends the format this
++ * blob was built for.
++ */
++#define FPCBEP_OFF_MSGBUF (0x196480)      /* where a type 8 message assembles */
++#define FPCBEP_OFF_STATE (0x196100)       /* 16 once the TLS session is up */
++#define FPCBEP_OFF_RECVLEN (0x19cf44)
++#define FPCBEP_OFF_DSTPTR (0x19cf48)
++#define FPCBEP_OFF_TOTAL (0x19cf50)
++
++#define FPC_IMG_MSG_PREFIX_HAVE (24)      /* what the a900 sends */
++#define FPC_IMG_MSG_PREFIX_WANT (34)      /* 0x18 + 0xa, what the blob computes */
++#define FPC_IMG_MSG_GAP (FPC_IMG_MSG_PREFIX_WANT - FPC_IMG_MSG_PREFIX_HAVE)
++
++/* Base address of the loaded libfpcbep.so, or NULL if it cannot be found. */
++static guint8 *
++fpc_blob_base (void)
++{
++  static guint8 *base = NULL;
++  static gboolean tried = FALSE;
++
++  if (!tried)
++    {
++      void *sym = dlsym (RTLD_DEFAULT, "fpc_enclave_init");
++      Dl_info di;
++
++      tried = TRUE;
++      if (sym != NULL && dladdr (sym, &di) != 0 && di.dli_fbase != NULL)
++        {
++          base = di.dli_fbase;
++          fp_dbg ("%s: libfpcbep at %p (%s)", G_STRFUNC, base, di.dli_fname);
++        }
++      else
++        {
++          fp_warn ("%s: cannot locate libfpcbep, image relayout unavailable",
++                   G_STRFUNC);
++        }
++    }
++
++  return base;
++}
++
++/*
++ * Insert FPC_IMG_MSG_GAP bytes between the metadata and the pixels of the image
++ * message the enclave is currently assembling. Call immediately after the
++ * fpc_enclave_process_data() that consumed the message's first record, and only
++ * on a device that needs it. Does nothing unless every precondition holds.
++ */
++static void
++fpc_img_msg_relayout (FpiDeviceFpcMoh *self)
++{
++  guint8 *base = fpc_blob_base ();
++  guint8 *msgbuf;
++  guint32 state, recv_len, total, want;
++
++  if (!self->relayout_img_msg || base == NULL)
++    return;
++
++  msgbuf = base + FPCBEP_OFF_MSGBUF;
++  state = *(guint32 *) (base + FPCBEP_OFF_STATE);
++  recv_len = *(guint32 *) (base + FPCBEP_OFF_RECVLEN);
++  total = *(guint32 *) (base + FPCBEP_OFF_TOTAL);
++
++  /* Not a message the blob is assembling into the image buffer. */
++  if (state != 16 || *(guint8 **) (base + FPCBEP_OFF_DSTPTR) != msgbuf)
++    return;
++
++  /* Nothing pending, or the message was already complete and dispatched inside
++   * the call -- too late to help, and nothing here would be safe to touch. */
++  if (recv_len == 0 || recv_len >= total)
++    return;
++
++  /* Only this sensor's layout, and only once per message: after the gap is
++   * opened total no longer matches, so a second call is a no-op. */
++  want = self->dev_ctx->img_w * self->dev_ctx->img_h;
++  if (total != want + FPC_IMG_MSG_PREFIX_HAVE)
++    return;
++
++  if (recv_len <= FPC_IMG_MSG_PREFIX_HAVE)
++    return;
++
++  memmove (msgbuf + FPC_IMG_MSG_PREFIX_WANT,
++           msgbuf + FPC_IMG_MSG_PREFIX_HAVE,
++           recv_len - FPC_IMG_MSG_PREFIX_HAVE);
++  memset (msgbuf + FPC_IMG_MSG_PREFIX_HAVE, 0, FPC_IMG_MSG_GAP);
++
++  *(guint32 *) (base + FPCBEP_OFF_RECVLEN) = recv_len + FPC_IMG_MSG_GAP;
++  *(guint32 *) (base + FPCBEP_OFF_TOTAL) = total + FPC_IMG_MSG_GAP;
++
++  fp_dbg ("%s: image message %u bytes for a %u byte image, opened a %u byte gap "
++          "at offset %u (recv_len %u -> %u)", G_STRFUNC, total, want,
++          (guint) FPC_IMG_MSG_GAP, (guint) FPC_IMG_MSG_PREFIX_HAVE,
++          recv_len, recv_len + FPC_IMG_MSG_GAP);
++}
++
++/* fpc_enclave_process_data(), plus the relayout, plus the return value the
++ * driver used to throw away. */
++static gint32
++fpc_process_data (FpiDeviceFpcMoh *self, const char *what)
++{
++  gint32 status = fpc_enclave_process_data (self->dev_ctx->enclave);
++
++  if (status != 0)
++    fp_warn ("fpc_enclave_process_data (%s) failed: %d", what, status);
++  else
++    fp_dbg ("fpc_enclave_process_data (%s) -> 0", what);
++
++  fpc_img_msg_relayout (self);
++
++  return status;
++}
++
+ typedef void (*SynCmdMsgCallback) (FpiDeviceFpcMoh *self,
+                                    guint8          *resp,
+                                    GError          *error);
+@@ -309,7 +473,7 @@
+ 
+   if (self->rem_received_len >= self->rem_expect_len)
+     {
+-      fpc_enclave_process_data (self->dev_ctx->enclave);
++      fpc_process_data (self, "trailing");
+       self->rem_expect_len = 0;
+       self->rem_received_len = 0;
+     }
+@@ -498,7 +662,7 @@
+     {
+       received_len = 0;
+       expect_len = 0;
+-      fpc_enclave_process_data (self->dev_ctx->enclave);
++      fpc_process_data (self, "dead pixel");
+ 
+       if (self->enroll_count++ < MAX_ENROLL_SAMPLES)
+         {
+@@ -653,7 +817,7 @@
+     {
+       received_len = 0;
+       expect_len = 0;
+-      fpc_enclave_process_data (self->dev_ctx->enclave);
++      fpc_process_data (self, "image");
+       fpi_ssm_next_state (transfer->ssm);
+     }
+   else
+@@ -1963,6 +2127,8 @@
+       /* patches/0006: sends three more records per capture than the eleven
+        * fixed read states consume. */
+       self->read_remaining = TRUE;
++      /* patches/0009: 24 byte image message prefix where libfpcbep.so wants 34. */
++      self->relayout_img_msg = TRUE;
+       break;
+ 
+     default:

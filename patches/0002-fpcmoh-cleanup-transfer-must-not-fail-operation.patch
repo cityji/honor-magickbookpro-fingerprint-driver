@@ -1,0 +1,112 @@
+fpcmoh: do not let a failed cleanup transfer sink a completed operation
+
+FP_VERIFY_CANCEL is the verify/identify SSM's start_cleanup state, so
+libfprint runs it at the end of *every* verify and identify -- on success as
+well as on failure. fpi_ssm_mark_completed() does not finish an SSM that is
+still below start_cleanup; it jumps to the cleanup state first:
+
+    /* libfprint/fpi-ssm.c, fpi_ssm_mark_completed */
+    /* complete in a cleanup state just moves forward one step */
+    if (machine->cur_state < machine->start_cleanup)
+      next_state = machine->start_cleanup;
+
+So FP_VERIFY_IDENTIFY (14), which reports the match result and calls
+fpi_ssm_mark_completed(), is always followed by FP_VERIFY_CANCEL (17).
+
+The cleanup state passed fpi_ssm_usb_transfer_cb as its completion handler,
+and that helper calls fpi_ssm_mark_failed() whenever the transfer errors. A
+cleanup command the device declines to answer therefore turns an operation
+that has already succeeded into a failed one.
+
+On FPC 10a5:a900 (Honor MagicBook, firmware 22.26.2.29) this is reliably
+fatal. The firmware acknowledges bRequest 0x03 during init in about 2 ms, but
+never answers it once a capture has completed; the transfer times out after
+1 s. Every enroll fails with "Device reported an error during identify for
+enroll: transfer timed out", after the image was captured and the host-side
+matcher had already run and reported correctly. It is not wValue-specific --
+0x0000 and 0x0001 were both tested and behave identically.
+
+Use a cleanup-specific callback that logs the failure and completes the state
+instead of failing the machine.
+
+This cannot mask a real error. fpi_ssm_mark_failed keeps only the first error
+recorded on a machine:
+
+    if (!machine->error)
+      machine->error = g_steal_pointer (&error);
+    else
+      g_error_free (error);
+
+so a failure raised in states 0..14 is already set on the SSM before cleanup
+runs, and completing cleanup without adding a new error leaves it intact for
+fpc_verify_ssm_done() to report via fpi_ssm_get_error(). The change is
+strictly a narrowing of when this SSM reports failure.
+
+This is not specific to the a900: any FPC MoH device whose firmware does not
+answer 0x03 in this state loses every operation the same way.
+
+Applies on top of merge request 396.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -825,6 +825,49 @@
+   return result;
+ }
+ 
++/* Completion handler for transfers issued from a *cleanup* state.
++ *
++ * FP_VERIFY_CANCEL is this SSM's start_cleanup state, so libfprint runs it at
++ * the end of every verify/identify -- on success as well as on failure.
++ * fpi_ssm_mark_completed() does not finish an SSM that is still below
++ * start_cleanup; it jumps to the cleanup state first (fpi-ssm.c: "complete in
++ * a cleanup state just moves forward one step"). A successful identify
++ * therefore reaches FP_VERIFY_CANCEL just like a failed one does.
++ *
++ * That makes fpi_ssm_usb_transfer_cb the wrong callback here: it calls
++ * fpi_ssm_mark_failed() on transfer error, so a cleanup command the device
++ * declines to answer turns an operation that already succeeded into a failure.
++ *
++ * Observed on FPC 10a5:a900 (Honor MagicBook, FW 22.26.2.29): the firmware
++ * acknowledges bRequest 0x03 during init in ~2 ms, but never answers it once a
++ * capture has completed. The transfer times out after 1 s and sinks an
++ * identify whose result was already reported. Not wValue-specific -- both
++ * 0x0000 and 0x0001 were tested and behave the same.
++ *
++ * Swallowing the error here cannot mask a genuine failure: fpi_ssm_mark_failed
++ * keeps only the *first* error ("if (!machine->error) machine->error = ..."),
++ * so an error raised in states 0..14 is already recorded on the SSM by the time
++ * cleanup runs, and completing cleanup without adding a new one leaves it
++ * intact for fpc_verify_ssm_done() to report.
++ */
++static void
++fpc_verify_cleanup_cb (FpiUsbTransfer *transfer,
++                       FpDevice       *device,
++                       gpointer        user_data,
++                       GError         *error)
++{
++  g_return_if_fail (transfer->ssm);
++
++  if (error)
++    {
++      fp_dbg ("%s: cleanup transfer failed (%s); not failing the operation",
++              G_STRFUNC, error->message);
++      g_clear_error (&error);
++    }
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
+ static void
+ fpc_verify_suspend_resume_cb (FpiUsbTransfer *transfer,
+                               FpDevice       *device,
+@@ -944,7 +987,9 @@
+ 
+     case FP_VERIFY_CANCEL:
+       {
+-        fpc_write_ctrl (ssm, device, 0x03, 0x01, NULL, 0, fpi_ssm_usb_transfer_cb, NULL);
++        /* Cleanup state -- see fpc_verify_cleanup_cb. A device that declines
++         * to answer this must not sink an operation that already succeeded. */
++        fpc_write_ctrl (ssm, device, 0x03, 0x01, NULL, 0, fpc_verify_cleanup_cb, NULL);
+       }
+       break;
+     }

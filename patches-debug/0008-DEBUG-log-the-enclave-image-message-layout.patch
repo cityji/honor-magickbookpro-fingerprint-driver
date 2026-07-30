@@ -1,0 +1,202 @@
+DEBUG ONLY (do not ship): log what the enclave thinks the image message is
+
+Applies on top of patches/0001-0006 and patches-debug/0007.
+
+fpc_enclave_process_data() returned -1 on the twelfth record of every capture
+and the driver threw the value away. Disassembling the blob says what -1 means,
+and it is one specific thing:
+
+    img_len = recv_len - 0xa - 0x18;                    /* 34 byte prefix */
+    if (img_len != fpc_bep_image_get_size (img))
+      return -1;
+
+-- the assembled message did not contain the number of pixel bytes the enclave
+expects. It is not a decrypt failure, not a TLS desync, and not a wrong-blob
+rejection: the enclave got the message, parsed its header, reassembled it, and
+disagreed about its length.
+
+Measured directly against the installed libfpcbep.so, so this is not in doubt:
+
+    fpc_hw_get_sensor_details_for_hardware_id(0x331) -> type 7, w 64, h 176
+    fpc_enclave_init(enclave, 0x331)                 -> 0
+    fpc_bep_image_get_size(image)                    -> 11264 == 64 * 176
+
+What is still unknown is the length the a900 declares, so log it: the message
+type and total length from the message's own header, the running byte count, and
+the first 48 bytes of the assembled buffer, after every process_data() call.
+
+Offsets into libfpcbep.so are from its disassembly (md5
+f7136fd774d5208e629bbeaa4974543a) and are validated at run time against the TLS
+state word, which reads 16 once the session is established. If the offsets are
+wrong for some other build of the blob the log says so and nothing else happens
+-- these are reads of the blob's own data, no writes.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -19,9 +19,133 @@
+ #include "drivers_api.h"
+ #include "fpc.h"
+ #include <byteswap.h>
++#include <dlfcn.h>
+ 
+ G_DEFINE_TYPE (FpiDeviceFpcMoh, fpi_device_fpcmoh, FP_TYPE_DEVICE);
+ 
++/* ---------------------------------------------------------------------------
++ * DEBUG ONLY (patches-debug/0008): look inside the enclave's message assembly.
++ *
++ * fpc_enclave_process_data() -> fpc_enclave_process_data_ecall() reassembles one
++ * application message out of however many TLS records it takes, in file-static
++ * state, and only when it is complete does it hand the pixels to the algorithm:
++ *
++ *     if (recv_len == 0)                       // first record of a message
++ *       n = mbedtls_ssl_read(ssl, buf, 0x800);
++ *       type  = be32(buf + 0);                 // 8 = FPC_EVT_IMG, 4 = dead pixel
++ *       total = be32(buf + 4);                 // whole message, header included
++ *       dst   = (type == 8) ? msgbuf : deadpixbuf;   else return -6
++ *       memcpy(dst, buf, n); recv_len = n;
++ *     else
++ *       recv_len += mbedtls_ssl_read(ssl, dst + recv_len, total - recv_len);
++ *     if (recv_len < total)  return 0;         // need more records
++ *     if (recv_len > total)  return -6;
++ *     if (type == 8)                           // message complete
++ *       {
++ *         img_len = recv_len - 0xa - 0x18;     // 34 byte prefix, hardcoded
++ *         if (img_len != fpc_bep_image_get_size(img))   return -1;   <-- ours
++ *         ... write metadata, run the algorithm ...
++ *       }
++ *
++ * so the -1 the driver was throwing away means exactly one thing: the number of
++ * pixel bytes in the message was not the number the enclave expects. Everything
++ * else about the blob is right for this sensor -- measured directly against it:
++ *
++ *     fpc_hw_get_sensor_details_for_hardware_id(0x331) -> type 7, w 64, h 176
++ *     fpc_enclave_init(enclave, 0x331)                -> 0
++ *     fpc_bep_image_get_size(image)                   -> 11264 == 64 * 176
++ *
++ * What is not known is what the a900 actually declares, so log it: the message
++ * type and length out of the message's own header, the running total, and the
++ * first bytes of the assembled buffer. Offsets are from the disassembly of the
++ * installed libfpcbep.so, md5 f7136fd774d5208e629bbeaa4974543a; validated at
++ * run time against the TLS state word, which reads 16 once the session is up.
++ */
++#define FPCBEP_OFF_MSGBUF (0x196480)      /* type 8 messages assemble here */
++#define FPCBEP_OFF_STATE (0x196100)       /* 16 == TLS session established */
++#define FPCBEP_OFF_RECVLEN (0x19cf44)
++#define FPCBEP_OFF_DSTPTR (0x19cf48)
++#define FPCBEP_OFF_TOTAL (0x19cf50)
++
++static guint8 *
++fpc_dbg_blob_base (void)
++{
++  static guint8 *base = NULL;
++  static gboolean tried = FALSE;
++
++  if (!tried)
++    {
++      void *sym = dlsym (RTLD_DEFAULT, "fpc_enclave_init");
++      Dl_info di;
++
++      tried = TRUE;
++      if (sym && dladdr (sym, &di))
++        {
++          base = di.dli_fbase;
++          fp_info ("DBG: libfpcbep base %p (%s)", base, di.dli_fname);
++        }
++      else
++        {
++          fp_info ("DBG: cannot locate libfpcbep (%s)", dlerror ());
++        }
++    }
++
++  return base;
++}
++
++static void
++fpc_dbg_hex (const char *tag, const guint8 *p, guint n)
++{
++  GString *s = g_string_new (NULL);
++
++  for (guint i = 0; i < n; i++)
++    g_string_append_printf (s, "%02x%s", p[i], (i % 4 == 3) ? " " : "");
++  fp_info ("DBG:   %s %s", tag, s->str);
++  g_string_free (s, TRUE);
++}
++
++/* Call right after fpc_enclave_process_data(). */
++static void
++fpc_dbg_enclave (const char *tag, gint ret)
++{
++  static guint32 last_total = 0;
++  guint8 *b = fpc_dbg_blob_base ();
++  guint32 state, recv, total;
++  const guint8 *msgbuf, *dst;
++
++  if (!b)
++    {
++      fp_info ("DBG: %s -> %d", tag, ret);
++      return;
++    }
++
++  msgbuf = b + FPCBEP_OFF_MSGBUF;
++  state = *(guint32 *) (b + FPCBEP_OFF_STATE);
++  recv = *(guint32 *) (b + FPCBEP_OFF_RECVLEN);
++  total = *(guint32 *) (b + FPCBEP_OFF_TOTAL);
++  dst = *(const guint8 **) (b + FPCBEP_OFF_DSTPTR);
++
++  fp_info ("DBG: %s -> %d | tls_state %u recv_len %u total %u dst %s",
++           tag, ret, state, recv, total,
++           dst == NULL ? "(reset)" : dst == msgbuf ? "msgbuf" : "other");
++
++  if (total)
++    last_total = total;
++
++  /* The message's own header, as the enclave parsed it. Present from the first
++   * record onwards and not cleared when the counters reset. */
++  fpc_dbg_hex ("hdr ", msgbuf, 48);
++
++  /* On the call that completed a message, where do the pixels stop? */
++  if (recv == 0 && last_total > 48 && last_total < 26000)
++    {
++      fp_info ("DBG:   completed message, declared total %u, "
++               "enclave computes img_len %u, wants %u",
++               last_total, last_total - 0x22, 64 * 176);
++      fpc_dbg_hex ("tail", msgbuf + last_total - 32, 32);
++    }
++}
++
+ typedef void (*SynCmdMsgCallback) (FpiDeviceFpcMoh *self,
+                                    guint8          *resp,
+                                    GError          *error);
+@@ -309,8 +433,8 @@
+ 
+   if (self->rem_received_len >= self->rem_expect_len)
+     {
+-      fp_info ("DBG: enclave_process_data (trailing) -> %d",
+-               fpc_enclave_process_data (self->dev_ctx->enclave));
++      fpc_dbg_enclave ("process_data (trailing)",
++                       fpc_enclave_process_data (self->dev_ctx->enclave));
+       self->rem_expect_len = 0;
+       self->rem_received_len = 0;
+     }
+@@ -499,8 +623,8 @@
+     {
+       received_len = 0;
+       expect_len = 0;
+-      fp_info ("DBG: enclave_process_data (deadpix) -> %d",
+-               fpc_enclave_process_data (self->dev_ctx->enclave));
++      fpc_dbg_enclave ("process_data (deadpix)",
++                       fpc_enclave_process_data (self->dev_ctx->enclave));
+ 
+       if (self->enroll_count++ < MAX_ENROLL_SAMPLES)
+         {
+@@ -657,8 +781,8 @@
+     {
+       received_len = 0;
+       expect_len = 0;
+-      fp_info ("DBG: enclave_process_data (img) -> %d",
+-               fpc_enclave_process_data (self->dev_ctx->enclave));
++      fpc_dbg_enclave ("process_data (img)",
++                       fpc_enclave_process_data (self->dev_ctx->enclave));
+       fpi_ssm_next_state (transfer->ssm);
+     }
+   else

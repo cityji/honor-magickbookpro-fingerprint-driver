@@ -1,0 +1,162 @@
+name: release
+
+# Publishes an installable bundle per Ubuntu release, plus the complete source,
+# on every v* tag.
+#
+# What is in a bundle: the built libfprint-2.so.2.0.0, the installer, the udev
+# rule and systemd drop-in it writes, and get-blob.sh. What is NOT in it: the
+# proprietary matcher (libfpcbep.so) -- get-blob.sh fetches that from Lenovo's
+# public download at install time.
+#
+# The prebuilt library is a convenience, not the supported path. It has to match
+# your glib/gusb/nss ABI, so it is tied to the Ubuntu release it was built on.
+# If fprintd fails to start after installing a bundle, build from source
+# instead: ./bootstrap.sh. That always works.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (must already exist)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.runner }}
+    name: bundle ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git curl unzip meson ninja-build gcc g++ pkg-config python3 \
+            libglib2.0-dev libgusb-dev libnss3-dev libusb-1.0-0-dev \
+            libpixman-1-dev libgudev-1.0-dev libjson-glib-dev binutils
+
+      - name: Build
+        run: STUB_BLOB=1 ./build.sh
+
+      - name: Assemble the bundle
+        run: |
+          set -e
+          VER="${GITHUB_REF_NAME}"
+          NAME="fpc-a900-libfprint-${VER}-${{ matrix.runner }}"
+          mkdir -p "out/$NAME"
+          cp dist/libfprint-2.so.2.0.0 "out/$NAME/"
+          cp install.sh uninstall.sh get-blob.sh "out/$NAME/"
+          cp -r patches "out/$NAME/"
+          cp README.md LICENSE "out/$NAME/"
+          mkdir -p "out/$NAME/dist"
+          mv "out/$NAME/libfprint-2.so.2.0.0" "out/$NAME/dist/"
+
+          cat > "out/$NAME/INSTALL.txt" <<EOF
+          Prebuilt for ${{ matrix.runner }}, built from tag ${VER}.
+
+              ./get-blob.sh          # fetch the proprietary matcher from Lenovo
+              sudo ./install.sh      # install for fprintd only
+              fprintd-enroll
+              fprintd-verify         # must print: Verify result: verify-match
+
+          This library was compiled on ${{ matrix.runner }} and links the same
+          glib/gusb/nss as that release. On a different distro it may fail to
+          load. In that case build from source, which is the supported path:
+
+              git clone $GITHUB_SERVER_URL/$GITHUB_REPOSITORY
+              cd $(basename $GITHUB_REPOSITORY) && ./bootstrap.sh
+
+          libfprint is LGPL-2.1. The complete corresponding source is the
+          upstream v1.94.6 tag, plus merge request 396, plus patches/ in this
+          bundle -- build.sh fetches the first two and applies the third.
+          EOF
+
+          tar -C out -czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          ls -la "$NAME.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.runner }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  publish:
+    needs: bundle
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Source tarball (LGPL-2.1 corresponding source)
+        run: |
+          VER="${GITHUB_REF_NAME}"
+          git archive --format=tar.gz --prefix="fpc-a900-src-${VER}/" \
+            -o "fpc-a900-src-${VER}.tar.gz" HEAD
+          sha256sum "fpc-a900-src-${VER}.tar.gz" > "fpc-a900-src-${VER}.tar.gz.sha256"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="${GITHUB_REF_NAME}"
+          find artifacts -type f -print
+          cat > notes.md <<EOF
+          ## Install on a fresh system
+
+          One command, builds from source, works on any glibc distro with the
+          usual build tools:
+
+          \`\`\`
+          curl -fsSL $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/raw/${VER}/bootstrap.sh | bash
+          \`\`\`
+
+          Or use a prebuilt bundle below if it matches your Ubuntu release:
+
+          \`\`\`
+          tar xzf fpc-a900-libfprint-${VER}-ubuntu-24.04.tar.gz
+          cd fpc-a900-libfprint-${VER}-ubuntu-24.04
+          ./get-blob.sh && sudo ./install.sh
+          fprintd-enroll && fprintd-verify
+          \`\`\`
+
+          ## What is not in these files
+
+          \`libfpcbep.so\`, the proprietary host-side matcher, is not
+          redistributable and is not included. \`get-blob.sh\` fetches it from
+          Lenovo's public driver download and verifies its md5. See
+          \`docs/DEVICE.md\`.
+
+          ## Hardware
+
+          USB \`10a5:a900\`, Fingerprint Cards match-on-host sensor, 64x176
+          8-bit image, host-side matching over TLS-PSK. Also carries the
+          \`10a5:9800\` id from merge request 396. Full teardown in
+          \`docs/INVESTIGATION.md\`.
+          EOF
+
+          gh release create "$VER" \
+            --title "$VER" \
+            --notes-file notes.md \
+            $(find artifacts -type f | tr '\n' ' ') \
+            "fpc-a900-src-${VER}.tar.gz" \
+            "fpc-a900-src-${VER}.tar.gz.sha256"

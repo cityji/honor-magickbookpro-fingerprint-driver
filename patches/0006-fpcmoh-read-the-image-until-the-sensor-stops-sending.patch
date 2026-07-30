@@ -1,0 +1,297 @@
+fpcmoh: read the image until the sensor stops sending
+
+This is the fix. Everything the a900 was blamed for -- "goes silent on EP0
+after a capture", "resets itself", "cannot re-arm" -- is one driver bug: the
+image read loop walks away while the sensor is still transmitting.
+
+fpc_ssm_img_read_cb() consumes exactly one record per SSM state, and both state
+machines provide exactly eleven read states (FP_*_WAIT4IMG_SEQ1..SEQ11). The
+driver therefore always reads eleven records and then stops, whatever the sensor
+still has queued. On the 10a5:a900 there are three more per capture -- measured
+from usbmon, immediately after the eleventh record ends on its short packet:
+
+    993 bytes   evt cmdid 5
+     81 bytes   evt cmdid 5
+     12 bytes   evt cmdid 6
+
+Two separate things go wrong when they are left unread, and both had to be fixed
+to get a working login.
+
+1. The sensor's control handler does not service endpoint 0 while an IN transfer
+   is outstanding, so the next control command times out whatever it is. 0x02
+   (arm), 0x03 (abort) and 0x0A (dead pixel) were each observed hanging, 109 us
+   after the last image packet; the same 0x02 completes in 12.7 ms when no
+   capture has happened. ~1.08 s later the firmware watchdog resets the sensor,
+   which drops off the bus and re-enumerates at a new address -- measured at
+   +1.073 s and +1.076 s from the last image packet, and it fires whether or not
+   the host sends anything (a run that waited 3 s in silence found the device
+   already gone: ENODEV, not a timeout). None of this is command-specific,
+   wValue-specific, or caused by the cleanup path, and the sensor is not asleep:
+   the bulk endpoint answers throughout, ~100 us per read.
+
+2. These are TLS records, so they must be handed to the enclave rather than just
+   drained off the wire. Skipping them desynchronises the TLS sequence
+   numbering, every subsequent decrypt fails, and fpc_tee_end_enroll() returns -1
+   with a 92-byte template. Draining and discarding was tried first and produces
+   an enrollment that passes all eleven stages, reports enroll-completed, stores
+   a print -- and then verifies against nothing.
+
+So FP_ENROLL_X_POSTDRAIN / FP_VERIFY_READ_REMAINING sit immediately after each
+image loop, before any control transfer, and read and process trailing records
+exactly as fpc_ssm_img_read_cb() does, looping until a read times out. The cost
+in the normal case is one timeout (200 ms) per capture.
+
+Enabled per device from fpc_dev_probe(), because on a sensor that really does
+send exactly eleven records this would add that timeout for nothing. Only the
+a900 sets it; the 9800 is untouched.
+
+Applies on top of merge request 396 and patches 0001-0005.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.h
++++ b/libfprint/drivers/fpcmoh/fpc.h
+@@ -280,6 +280,10 @@
+   FP_VERIFY_WAIT4IMG_SEQ9,
+   FP_VERIFY_WAIT4IMG_SEQ10,
+   FP_VERIFY_WAIT4IMG_SEQ11,
++
++  /* patches/0006: keep reading records until the sensor stops. */
++  FP_VERIFY_READ_REMAINING,
++
+   FP_VERIFY_IDENTIFY,
+   FP_VERIFY_SUSPENDED,
+   FP_VERIFY_RESUME,
+@@ -328,4 +332,11 @@
+   /* EXPERIMENT (patches/0005) counters, see FP_ENROLL_X_* above. */
+   guint           x_retry_count;
+   guint           x_drain_count;
++
++  /* patches/0006: this sensor sends more records per capture than the eleven
++   * the fixed read states consume; these track the trailing ones. */
++  gboolean        read_remaining;
++  guint32         rem_expect_len;
++  guint32         rem_received_len;
++  guint           rem_reads;
+ };
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -207,6 +207,148 @@
+   return (s && *s) ? (gint) g_ascii_strtoll (s, NULL, 10) : dflt;
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * patches/0006: read the image until the sensor stops sending.
++ *
++ * fpc_ssm_img_read_cb() consumes exactly one record per SSM state, and both
++ * state machines provide exactly eleven read states (FP_*_WAIT4IMG_SEQ1..SEQ11).
++ * The driver therefore always reads eleven records and then stops, whatever the
++ * sensor still has queued. On the 10a5:a900 there are three more per capture --
++ * measured from usbmon, immediately after the eleventh record ends on its short
++ * packet:
++ *
++ *     993 bytes   evt cmdid 5
++ *      81 bytes   evt cmdid 5
++ *      12 bytes   evt cmdid 6
++ *
++ * Two separate things go wrong when they are left unread.
++ *
++ * First, the sensor's control handler does not service endpoint 0 while an IN
++ * transfer is outstanding, so the next control command times out no matter what
++ * it is. 0x02 (arm), 0x03 (abort) and 0x0A (dead pixel) were each observed
++ * hanging, 109 us after the last image packet; the same 0x02 completes in
++ * 12.7 ms when no capture has happened. ~1.08 s later the firmware watchdog
++ * resets the sensor, which drops off the bus and re-enumerates at a new address
++ * (measured at +1.073 s and +1.076 s from the last image packet, and it happens
++ * whether or not the host sends anything -- a run that waited 3 s in silence
++ * found the device already gone, ENODEV rather than a timeout).
++ *
++ * Second, these are TLS records. They must be handed to the enclave, not merely
++ * drained: skipping them desynchronises the TLS sequence numbering, every
++ * subsequent decrypt fails, and fpc_tee_end_enroll() returns -1 with a 92-byte
++ * template that matches nothing. Draining and discarding produces an enrollment
++ * that completes all eleven stages and then never verifies.
++ *
++ * So this reads and processes trailing records exactly as fpc_ssm_img_read_cb()
++ * does, looping until a read times out. Reads with data waiting complete in
++ * ~100 us, so the cost in the normal case is one timeout per capture.
++ *
++ * Enabled per device from fpc_dev_probe(): on a sensor that really does send
++ * exactly eleven records this would add that timeout for nothing.
++ */
++#define FPC_REM_MAX_READS (512)
++#define FPC_REM_TIMEOUT (200)
++
++static void
++fpc_read_remaining_cb (FpiUsbTransfer *transfer,
++                       FpDevice       *device,
++                       gpointer        user_data,
++                       GError         *error)
++{
++  FpiDeviceFpcMoh *self = FPI_DEVICE_FPCMOH (device);
++
++  g_return_if_fail (transfer->ssm);
++
++  if (error)
++    {
++      /* A timeout between records is how this is meant to end. */
++      if (self->rem_expect_len == 0)
++        {
++          fp_dbg ("%s: sensor has nothing further to send (%s)",
++                  G_STRFUNC, error->message);
++          g_clear_error (&error);
++          fpi_ssm_next_state (transfer->ssm);
++          return;
++        }
++
++      fp_err ("%s: sensor stopped %u bytes into a %u byte record",
++              G_STRFUNC, self->rem_received_len, self->rem_expect_len);
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  if (self->rem_expect_len == 0)
++    {
++      evt_hdr_t *evt = (evt_hdr_t *) transfer->buffer;
++
++      if (transfer->actual_length < sizeof (evt_hdr_t))
++        {
++          fp_err ("%s: %" G_GSIZE_FORMAT " byte runt where a record header was expected",
++                  G_STRFUNC, (gsize) transfer->actual_length);
++          fpi_ssm_mark_failed (transfer->ssm,
++                               fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
++          return;
++        }
++
++      self->rem_expect_len = GUINT32_FROM_BE (evt->length);
++      self->rem_received_len = transfer->actual_length;
++
++      fp_dbg ("%s: trailing record, evtid %u, len %u", G_STRFUNC,
++              GUINT32_FROM_BE (evt->cmdid), self->rem_expect_len);
++
++      fpc_tls_buff_clear ();
++      if (transfer->actual_length > sizeof (evt_hdr_t))
++        fpc_tls_buff_put (transfer->buffer + sizeof (evt_hdr_t),
++                          transfer->actual_length - sizeof (evt_hdr_t));
++    }
++  else
++    {
++      fpc_tls_buff_put (transfer->buffer, transfer->actual_length);
++      self->rem_received_len += transfer->actual_length;
++    }
++
++  if (self->rem_received_len >= self->rem_expect_len)
++    {
++      fpc_enclave_process_data (self->dev_ctx->enclave);
++      self->rem_expect_len = 0;
++      self->rem_received_len = 0;
++    }
++
++  fpi_ssm_jump_to_state (transfer->ssm, fpi_ssm_get_cur_state (transfer->ssm));
++}
++
++/* Returns FALSE when there is nothing left to do and the SSM should advance. */
++static gboolean
++fpc_read_remaining_step (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceFpcMoh *self = FPI_DEVICE_FPCMOH (device);
++  FpiUsbTransfer *transfer = NULL;
++
++  if (!self->read_remaining)
++    return FALSE;
++
++  if (self->rem_reads++ >= FPC_REM_MAX_READS)
++    {
++      fp_warn ("%s: giving up after %u reads", G_STRFUNC, FPC_REM_MAX_READS);
++      return FALSE;
++    }
++
++  transfer = fpi_usb_transfer_new (device);
++  transfer->ssm = ssm;
++  fpi_usb_transfer_fill_bulk (transfer, EP_IN, EP_IN_MAX_BUF_SIZE);
++  fpi_usb_transfer_submit (transfer, FPC_REM_TIMEOUT, NULL,
++                           fpc_read_remaining_cb, NULL);
++  return TRUE;
++}
++
++static void
++fpc_read_remaining_reset (FpiDeviceFpcMoh *self)
++{
++  self->rem_expect_len = 0;
++  self->rem_received_len = 0;
++  self->rem_reads = 0;
++}
++
+ static void fpc_init_sm_run_state (FpiSsm   *ssm,
+                                    FpDevice *device);
+ 
+@@ -809,6 +951,7 @@
+ 
+     case FP_ENROLL_CAPTURE:
+       {
++        fpc_read_remaining_reset (self);
+         fpc_tls_buff_clear ();
+         fpc_write_ctrl_timeout (ssm, device, 0x02, 0x01,
+                                 (guint8 *) &capture_id, sizeof (guint32),
+@@ -869,23 +1012,10 @@
+       break;
+ 
+     case FP_ENROLL_X_POSTDRAIN:
+-      {
+-        gint n = fpc_x_env ("FPC_X_POSTDRAIN", 0);
+-
+-        if (n <= 0 || (gint) self->x_drain_count >= n)
+-          {
+-            fpi_ssm_next_state (ssm);
+-            break;
+-          }
+-
+-        self->x_drain_count++;
+-        transfer = fpi_usb_transfer_new (device);
+-        transfer->ssm = ssm;
+-        fpi_usb_transfer_fill_bulk (transfer, EP_IN, EP_IN_MAX_BUF_SIZE);
+-        fpi_usb_transfer_submit (transfer,
+-                                 fpc_x_env ("FPC_X_POSTDRAIN_MS", 300),
+-                                 NULL, fpc_x_drain_cb, NULL);
+-      }
++      /* patches/0006: the sensor is still transmitting here and endpoint 0 will
++       * not answer until it has finished. See fpc_read_remaining_step(). */
++      if (!fpc_read_remaining_step (ssm, device))
++        fpi_ssm_next_state (ssm);
+       break;
+ 
+     case FP_ENROLL_SEND_DEAD_PIXEL:
+@@ -1221,6 +1351,7 @@
+     {
+     case FP_VERIFY_CAPTURE:
+       {
++        fpc_read_remaining_reset (self);
+         guint32 capture_id = FPC_CAPTUREID_RESERVED;
+         fpc_write_ctrl (ssm, device, 0x02, 0x01, (guint8 *) &capture_id, sizeof (guint32), fpi_ssm_usb_transfer_cb, NULL);
+       }
+@@ -1256,6 +1387,12 @@
+       }
+       break;
+ 
++    case FP_VERIFY_READ_REMAINING:
++      /* patches/0006, as FP_ENROLL_X_POSTDRAIN. */
++      if (!fpc_read_remaining_step (ssm, device))
++        fpi_ssm_next_state (ssm);
++      break;
++
+     case FP_VERIFY_IDENTIFY:
+       {
+         fpcmoh_match_report (device, self->dev_ctx->bio);
+@@ -1818,8 +1955,14 @@
+   switch (productid)
+     {
+     case 0x9800:
++      self->max_enroll_stage = MAX_ENROLL_SAMPLES;
++      break;
++
+     case 0xA900:
+       self->max_enroll_stage = MAX_ENROLL_SAMPLES;
++      /* patches/0006: sends three more records per capture than the eleven
++       * fixed read states consume. */
++      self->read_remaining = TRUE;
+       break;
+ 
+     default:

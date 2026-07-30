@@ -1,0 +1,567 @@
+EXPERIMENT (not a proposed fix): env-selected post-capture recovery probes
+
+The a900 stops answering endpoint 0 once an image capture has completed. The
+byte-identical vendor command `40 02 0001 / 0f100107` -- FP_ENROLL_CAPTURE's
+"arm" -- is acknowledged in 12.7 ms before a capture and is still unanswered
+1 s after one; ~1.07 s after that SETUP the sensor drops off the bus and
+re-enumerates. Enrollment therefore never gets past its first sample.
+
+This patch adds six independent recovery attempts, each OFF by default and
+each selected by an environment variable, so that all of them share ONE build
+and ONE install instead of six rebuild/reinstall cycles:
+
+  FPC_X_DELAY_MS            wait this long after the previous capture before
+                            re-arming. Doubles as the control measurement:
+                            with a long delay and nothing in flight, usbmon
+                            shows whether the sensor disconnects on its own or
+                            only while a SETUP is outstanding.
+  FPC_X_DRAIN, _MS          up to N short-timeout bulk-IN reads before
+                            re-arming, in case a queued event is blocking the
+                            device's EP0 handler.
+  FPC_X_POSTDRAIN, _MS      the same reads, but issued immediately after the
+                            image loop instead of before the next arm. This is
+                            the only intervention still possible inside the
+                            window: measured, EP0 stops answering 109 us after
+                            the last image packet and the sensor detaches
+                            1.076 s later, so no control command can help and a
+                            bulk read is all that is left.
+  FPC_X_POSTDELAY_MS        pause after the image before the next command, to
+                            test whether EP0 recovers inside that window.
+  FPC_X_REINIT              1 = re-send the init prologue (0x01, event read,
+                                0x08, 0x0b read)
+                            2 = full init including a fresh TLS handshake,
+                                keeping the existing tee/bio
+                            3 = as 2, preceded by release-interface,
+                                g_usb_device_reset() and re-claim
+  FPC_X_CAPTURE_TIMEOUT_MS  timeout for the enroll arm command ONLY. The
+                            device dies ~72 ms after the host cancels that
+                            transfer, which no run so far can distinguish from
+                            a ~1.07 s firmware watchdog; raising just this one
+                            timeout does distinguish them. Init keeps
+                            CTRL_TIMEOUT so an absent device still fails fast.
+  FPC_X_RETRIES, _MS        retry the arm command instead of failing the whole
+                            operation on the first timeout.
+  FPC_X_NODUP               do not advertise FP_DEVICE_FEATURE_IDENTIFY, so no
+                            identify capture runs ahead of the enroll and the
+                            first arm lands in the state the device answers.
+                            The gate really is IDENTIFY and not
+                            DUPLICATES_CHECK: fprintd 1.94.3 src/device.c,
+                            fprint_device_enroll_start, keys the pre-enroll
+                            identify off FP_DEVICE_FEATURE_IDENTIFY and runs it
+                            even when the gallery is empty. Measured: clearing
+                            DUPLICATES_CHECK alone changed nothing at all.
+
+Three new states (FP_ENROLL_X_DELAY / _DRAIN / _REINIT) sit immediately before
+FP_ENROLL_CAPTURE. fpc_read_dead_pixels() loops back to FP_ENROLL_X_DELAY
+rather than FP_ENROLL_CAPTURE, so whatever clears the wedge runs before EVERY
+sample, not just the first -- an enrollment needs eleven captures, so a fix
+that only worked once would be no fix at all.
+
+Safety: no bmRequestType 0x40 request is sent with a bRequest the driver does
+not already issue (0x01, 0x02, 0x05, 0x06, 0x08, 0x09, 0x0b only). The drain
+state only reads a bulk endpoint. g_usb_device_reset() and claim/release are
+the same calls fpc_dev_init() makes at every open.
+
+Two things the re-init path is careful about:
+
+  - fpc_connect_tls() calls fpc_tls_buff_init()/fpc_tls_write_buff_init()
+    unconditionally, so fpc_reinit_sm_run_state() releases the live buffers
+    first.
+  - it does NOT re-run FPC_INIT_TEE_INIT. fpc_tee_begin_enroll() ran back in
+    FP_ENROLL_BEGIN and the accumulator is entirely host-side in libfpcbep.so
+    (measured: zero USB traffic between the last image record and the arm
+    command), so re-creating the tee/bio would silently discard every sample
+    taken so far.
+
+fpc_write_ctrl() is refactored into fpc_write_ctrl_timeout() plus a wrapper
+that passes CTRL_TIMEOUT; no existing call site changes behaviour.
+
+With every variable unset this patch is behaviour-identical to 0001..0004.
+
+Applies on top of merge request 396 and patches 0001-0004.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.h
++++ b/libfprint/drivers/fpcmoh/fpc.h
+@@ -221,6 +221,16 @@
+ 
+ typedef enum {
+   FP_ENROLL_BEGIN = 0,
++
++  /* EXPERIMENT (patches/0005): post-capture recovery attempts, all of them
++   * no-ops unless the matching FPC_X_* environment variable is set. They sit
++   * immediately before FP_ENROLL_CAPTURE and are re-entered before *every*
++   * sample, not just the first, because fpc_read_dead_pixels() loops back
++   * here. See the block comment above fpc_x_env() in fpc.c. */
++  FP_ENROLL_X_DELAY,
++  FP_ENROLL_X_DRAIN,
++  FP_ENROLL_X_REINIT,
++
+   FP_ENROLL_CAPTURE,
+   FP_ENROLL_WAIT4FINGERDOWN,
+ 
+@@ -237,6 +247,14 @@
+   FP_ENROLL_WAIT4IMG_SEQ9,
+   FP_ENROLL_WAIT4IMG_SEQ10,
+   FP_ENROLL_WAIT4IMG_SEQ11,
++
++  /* EXPERIMENT (patches/0005): the ONLY intervention still possible inside the
++   * window. EP0 is already dead 109 us after the last image packet, so no
++   * control command can help; a bulk read is the only thing left that the host
++   * can do before the sensor detaches at +1.08 s. */
++  FP_ENROLL_X_POSTDELAY,
++  FP_ENROLL_X_POSTDRAIN,
++
+   FP_ENROLL_SEND_DEAD_PIXEL,
+   FP_ENROLL_READ_DEAD_PIXEL,
+ 
+@@ -306,4 +324,8 @@
+   gint            max_immobile_stage;
+   PDEVICE_CONTEXT dev_ctx;
+   GCancellable   *interrupt_cancellable;
++
++  /* EXPERIMENT (patches/0005) counters, see FP_ENROLL_X_* above. */
++  guint           x_retry_count;
++  guint           x_drain_count;
+ };
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -104,18 +104,19 @@
+ 
+ 
+ static void
+-fpc_write_ctrl (FpiSsm                *ssm,
+-                FpDevice              *dev,
+-                guint8                 cmdid,
+-                guint8                 value,
+-                guint8                *data,
+-                guint32                data_len,
+-                FpiUsbTransferCallback callback,
+-                gpointer               user_data)
++fpc_write_ctrl_timeout (FpiSsm                *ssm,
++                        FpDevice              *dev,
++                        guint8                 cmdid,
++                        guint8                 value,
++                        guint8                *data,
++                        guint32                data_len,
++                        guint                  timeout,
++                        FpiUsbTransferCallback callback,
++                        gpointer               user_data)
+ {
+   FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
+ 
+-  fp_dbg ("send cmdid %02x", cmdid);
++  fp_dbg ("send cmdid %02x (timeout %u ms)", cmdid, timeout);
+   fpi_usb_transfer_fill_control (transfer,
+                                  G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
+                                  G_USB_DEVICE_REQUEST_TYPE_VENDOR,
+@@ -129,11 +130,177 @@
+ 
+   transfer->ssm = ssm;
+ 
+-  fpi_usb_transfer_submit (transfer, CTRL_TIMEOUT, NULL,
++  fpi_usb_transfer_submit (transfer, timeout, NULL,
+                            callback, user_data);
+ }
+ 
+ static void
++fpc_write_ctrl (FpiSsm                *ssm,
++                FpDevice              *dev,
++                guint8                 cmdid,
++                guint8                 value,
++                guint8                *data,
++                guint32                data_len,
++                FpiUsbTransferCallback callback,
++                gpointer               user_data)
++{
++  fpc_write_ctrl_timeout (ssm, dev, cmdid, value, data, data_len,
++                          CTRL_TIMEOUT, callback, user_data);
++}
++
++/* ---------------------------------------------------------------------------
++ * EXPERIMENT (patches/0005): post-capture recovery probes for FPC 10a5:a900.
++ *
++ * The a900 stops answering endpoint 0 once an image capture has completed:
++ * the byte-identical vendor command 40 02 0001 / 0f100107 (FP_ENROLL_CAPTURE's
++ * "arm") is acknowledged in 12.7 ms before a capture and is still unanswered
++ * 1 s after one. Roughly 1.07 s after that SETUP the sensor drops its pull-up
++ * and re-enumerates. Enrollment therefore never gets past its first sample.
++ *
++ * Every knob below is OFF by default and each is selected by an environment
++ * variable, so all of them share one build and one install. Nothing here sends
++ * a bmRequestType 0x40 request the driver does not already issue elsewhere:
++ *
++ *   FPC_X_DELAY_MS           wait this long after the previous capture before
++ *                            re-arming. Also the control measurement: with a
++ *                            long enough delay and nothing in flight, usbmon
++ *                            shows whether the device disconnects on its own
++ *                            or only when a SETUP is outstanding.
++ *   FPC_X_DRAIN / _MS        do up to N bulk-IN reads with a short timeout
++ *                            before re-arming, in case the device still has a
++ *                            queued event that blocks its EP0 handler.
++ *   FPC_X_POSTDRAIN / _MS    the same, but immediately after the image loop
++ *                            rather than before the next arm. This is the only
++ *                            intervention still possible inside the window:
++ *                            measured, EP0 stops answering 109 us after the
++ *                            last image packet, so no control command can help,
++ *                            and the sensor detaches 1.08 s later.
++ *   FPC_X_POSTDELAY_MS       pause after the image before the next command, to
++ *                            see whether EP0 comes back inside that window.
++ *   FPC_X_REINIT             1 = re-send the init prologue (0x01, event read,
++ *                                0x08, 0x0b read);
++ *                            2 = full init incl. a fresh TLS handshake, but
++ *                                keeping the existing tee/bio so the samples
++ *                                collected so far are not thrown away;
++ *                            3 = as 2, preceded by release-interface,
++ *                                g_usb_device_reset() and re-claim -- the same
++ *                                sequence fpc_dev_init() runs at every open.
++ *   FPC_X_CAPTURE_TIMEOUT_MS timeout for the enroll arm command only. The
++ *                            device dies ~72 ms after the host cancels the
++ *                            transfer, which no run so far can separate from
++ *                            a ~1.07 s firmware watchdog; raising only this
++ *                            timeout does separate them. Init keeps
++ *                            CTRL_TIMEOUT so a genuinely absent device still
++ *                            fails fast.
++ *   FPC_X_RETRIES / _MS      retry the arm command instead of failing the
++ *                            operation on the first timeout.
++ *   FPC_X_NODUP              do not advertise FP_DEVICE_FEATURE_IDENTIFY, so
++ *                            no identify capture runs ahead of the enroll and
++ *                            the first arm lands in the state the device
++ *                            answers. See fpi_device_fpcmoh_class_init().
++ */
++static gint
++fpc_x_env (const char *name, gint dflt)
++{
++  const char *s = g_getenv (name);
++
++  return (s && *s) ? (gint) g_ascii_strtoll (s, NULL, 10) : dflt;
++}
++
++static void fpc_init_sm_run_state (FpiSsm   *ssm,
++                                   FpDevice *device);
++
++static void
++fpc_reinit_sm_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case FPC_INIT_TLS_CONNECT:
++      /* fpc_connect_tls() calls fpc_tls_buff_init()/fpc_tls_write_buff_init()
++       * unconditionally; release the live ones first so the second init does
++       * not run on top of them. */
++      fpc_tls_write_buff_release ();
++      fpc_tls_buff_release ();
++      break;
++
++    case FPC_INIT_TEE_INIT:
++      /* Deliberately NOT re-running fpc_tee_init()/fpc_tee_bio_init(): the bio
++       * holds this enrollment's accumulated samples (fpc_tee_begin_enroll ran
++       * back in FP_ENROLL_BEGIN, and those calls emit no USB traffic at all --
++       * the accumulator is entirely host-side in libfpcbep.so). Re-creating it
++       * here would silently discard every sample taken so far. */
++      fp_info ("a900-X: re-init finished, keeping tee/bio %p",
++               (void *) FPI_DEVICE_FPCMOH (device)->dev_ctx->bio);
++      fpi_ssm_mark_completed (ssm);
++      return;
++
++    default:
++      break;
++    }
++
++  fpc_init_sm_run_state (ssm, device);
++}
++
++static void
++fpc_x_drain_cb (FpiUsbTransfer *transfer,
++                FpDevice       *device,
++                gpointer        user_data,
++                GError         *error)
++{
++  g_return_if_fail (transfer->ssm);
++
++  if (error)
++    {
++      fp_info ("a900-X: drain read ended (%s) -- nothing was queued",
++               error->message);
++      g_clear_error (&error);
++      fpi_ssm_next_state (transfer->ssm);
++      return;
++    }
++
++  fp_info ("a900-X: drain read returned %" G_GSIZE_FORMAT
++           " bytes -- the device DID have queued data",
++           (gsize) transfer->actual_length);
++  /* Back to whichever of the two drain states issued this read. */
++  fpi_ssm_jump_to_state (transfer->ssm, fpi_ssm_get_cur_state (transfer->ssm));
++}
++
++static void
++fpc_enroll_capture_cb (FpiUsbTransfer *transfer,
++                       FpDevice       *device,
++                       gpointer        user_data,
++                       GError         *error)
++{
++  FpiDeviceFpcMoh *self = FPI_DEVICE_FPCMOH (device);
++  gint retries = fpc_x_env ("FPC_X_RETRIES", 0);
++
++  g_return_if_fail (transfer->ssm);
++
++  if (error)
++    {
++      if ((gint) self->x_retry_count < retries)
++        {
++          gint ms = fpc_x_env ("FPC_X_RETRY_MS", 500);
++
++          self->x_retry_count++;
++          fp_info ("a900-X: arm attempt %u failed (%s), retrying in %d ms",
++                   self->x_retry_count, error->message, ms);
++          g_clear_error (&error);
++          fpi_ssm_jump_to_state_delayed (transfer->ssm, FP_ENROLL_CAPTURE, ms);
++          return;
++        }
++
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  if (self->x_retry_count)
++    fp_info ("a900-X: arm succeeded on attempt %u", self->x_retry_count + 1);
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
+ fpc_read_dead_pixels (FpiUsbTransfer *transfer, FpDevice *device,
+                       gpointer unused_data, GError *error)
+ {
+@@ -195,7 +362,10 @@
+         {
+           result = fpc_tee_enroll (self->dev_ctx->bio, &remaining_samples);
+           fpi_device_enroll_progress (device, self->enroll_count, NULL, NULL);
+-          fpi_ssm_jump_to_state (transfer->ssm, FP_ENROLL_CAPTURE);
++          /* patches/0005: go via the FP_ENROLL_X_* recovery states rather than
++           * straight to FP_ENROLL_CAPTURE, so whatever clears the post-capture
++           * wedge runs before every sample and not only the first. */
++          fpi_ssm_jump_to_state (transfer->ssm, FP_ENROLL_X_DELAY);
+         }
+       else
+         {
+@@ -539,10 +709,111 @@
+       }
+       break;
+ 
++    /* EXPERIMENT (patches/0005) -- all three are no-ops unless the matching
++     * FPC_X_* variable is set. See the block comment above fpc_x_env(). */
++    case FP_ENROLL_X_DELAY:
++      {
++        gint ms = fpc_x_env ("FPC_X_DELAY_MS", 0);
++
++        self->x_retry_count = 0;
++        self->x_drain_count = 0;
++
++        if (ms > 0)
++          {
++            fp_info ("a900-X: waiting %d ms after the capture before re-arming", ms);
++            fpi_ssm_next_state_delayed (ssm, ms);
++          }
++        else
++          {
++            fpi_ssm_next_state (ssm);
++          }
++      }
++      break;
++
++    case FP_ENROLL_X_DRAIN:
++      {
++        gint n = fpc_x_env ("FPC_X_DRAIN", 0);
++
++        if (n <= 0 || (gint) self->x_drain_count >= n)
++          {
++            fpi_ssm_next_state (ssm);
++            break;
++          }
++
++        self->x_drain_count++;
++        transfer = fpi_usb_transfer_new (device);
++        transfer->ssm = ssm;
++        fpi_usb_transfer_fill_bulk (transfer, EP_IN, EP_IN_MAX_BUF_SIZE);
++        fpi_usb_transfer_submit (transfer,
++                                 fpc_x_env ("FPC_X_DRAIN_MS", 400),
++                                 NULL, fpc_x_drain_cb, NULL);
++      }
++      break;
++
++    case FP_ENROLL_X_REINIT:
++      {
++        gint level = fpc_x_env ("FPC_X_REINIT", 0);
++        GUsbDevice *usb_dev = fpi_device_get_usb_device (device);
++        g_autoptr(GError) err = NULL;
++        FpiSsm *sub = NULL;
++
++        if (level <= 0)
++          {
++            fpi_ssm_next_state (ssm);
++            break;
++          }
++
++        if (level >= 3)
++          {
++            fp_info ("a900-X: re-init level 3 -- release interface, USB reset, re-claim");
++            /* NB: not fpc_dev_release_interface(), which also calls
++             * fpi_device_close_complete() -- we are mid-enroll, not closing. */
++            if (!g_usb_device_release_interface (usb_dev, 0, 0, &err))
++              {
++                fp_warn ("a900-X: release_interface: %s", err->message);
++                g_clear_error (&err);
++              }
++            if (!g_usb_device_reset (usb_dev, &err))
++              {
++                fp_warn ("a900-X: g_usb_device_reset: %s", err->message);
++                g_clear_error (&err);
++              }
++            if (!g_usb_device_claim_interface (usb_dev, 0, 0, &err))
++              {
++                fp_err ("a900-X: claim_interface failed: %s", err->message);
++                fpi_ssm_mark_failed (ssm, g_steal_pointer (&err));
++                break;
++              }
++          }
++
++        /* A re-open generates a new session id; do the same here. */
++        fpc_secure_random ((uint8_t *) &(self->dev_ctx->yasc_session_id),
++                           sizeof (self->dev_ctx->yasc_session_id));
++
++        if (level == 1)
++          {
++            fp_info ("a900-X: re-init level 1 -- 0x01 / event / 0x08 / 0x0b only");
++            /* States 0..FPC_INIT_INIT of the init SSM: exactly the prologue,
++             * stopping before FPC_INIT_TLS_CONNECT. */
++            sub = fpi_ssm_new (device, fpc_init_sm_run_state, FPC_INIT_INIT + 1);
++          }
++        else
++          {
++            fp_info ("a900-X: re-init level %d -- full init incl. TLS handshake", level);
++            sub = fpi_ssm_new (device, fpc_reinit_sm_run_state, FPC_INIT_NUM_STATES);
++          }
++
++        fpi_ssm_start_subsm (ssm, sub);
++      }
++      break;
++
+     case FP_ENROLL_CAPTURE:
+       {
+         fpc_tls_buff_clear ();
+-        fpc_write_ctrl (ssm, device, 0x02, 0x01, (guint8 *) &capture_id, sizeof (guint32), fpi_ssm_usb_transfer_cb, NULL);
++        fpc_write_ctrl_timeout (ssm, device, 0x02, 0x01,
++                                (guint8 *) &capture_id, sizeof (guint32),
++                                fpc_x_env ("FPC_X_CAPTURE_TIMEOUT_MS", CTRL_TIMEOUT),
++                                fpc_enroll_capture_cb, NULL);
+       }
+       break;
+ 
+@@ -577,6 +848,46 @@
+       }
+       break;
+ 
++    /* EXPERIMENT (patches/0005): reached immediately after the image loop, ~100 us
++     * after the last image packet and ~1.08 s before the sensor detaches. */
++    case FP_ENROLL_X_POSTDELAY:
++      {
++        gint ms = fpc_x_env ("FPC_X_POSTDELAY_MS", 0);
++
++        self->x_drain_count = 0;
++
++        if (ms > 0)
++          {
++            fp_info ("a900-X: waiting %d ms after the image before the next command", ms);
++            fpi_ssm_next_state_delayed (ssm, ms);
++          }
++        else
++          {
++            fpi_ssm_next_state (ssm);
++          }
++      }
++      break;
++
++    case FP_ENROLL_X_POSTDRAIN:
++      {
++        gint n = fpc_x_env ("FPC_X_POSTDRAIN", 0);
++
++        if (n <= 0 || (gint) self->x_drain_count >= n)
++          {
++            fpi_ssm_next_state (ssm);
++            break;
++          }
++
++        self->x_drain_count++;
++        transfer = fpi_usb_transfer_new (device);
++        transfer->ssm = ssm;
++        fpi_usb_transfer_fill_bulk (transfer, EP_IN, EP_IN_MAX_BUF_SIZE);
++        fpi_usb_transfer_submit (transfer,
++                                 fpc_x_env ("FPC_X_POSTDRAIN_MS", 300),
++                                 NULL, fpc_x_drain_cb, NULL);
++      }
++      break;
++
+     case FP_ENROLL_SEND_DEAD_PIXEL:
+       {
+         fpc_write_ctrl (ssm, device, 0x0A, 0x00, NULL, 0, fpi_ssm_usb_transfer_cb, NULL);
+@@ -629,7 +940,7 @@
+ 
+       fpi_usb_transfer_submit (transfer, CTRL_TIMEOUT, NULL,
+                                fpc_enroll_suspend_resume_cb, NULL);
+-      fpi_ssm_jump_to_state (ssm, FP_ENROLL_CAPTURE);
++      fpi_ssm_jump_to_state (ssm, FP_ENROLL_X_DELAY);
+ 
+       break;
+ 
+@@ -1640,8 +1951,23 @@
+ 
+   fp_dbg ("%s enter -->", G_STRFUNC);
+ 
++  /* patches/0005: make every run self-documenting -- which experiment produced
++   * a given log is otherwise guesswork after the fact. */
++  fp_info ("a900-X: delay=%dms drain=%dx%dms reinit=%d arm_timeout=%dms "
++           "retries=%dx%dms nodup=%d",
++           fpc_x_env ("FPC_X_DELAY_MS", 0),
++           fpc_x_env ("FPC_X_DRAIN", 0),
++           fpc_x_env ("FPC_X_DRAIN_MS", 400),
++           fpc_x_env ("FPC_X_REINIT", 0),
++           fpc_x_env ("FPC_X_CAPTURE_TIMEOUT_MS", CTRL_TIMEOUT),
++           fpc_x_env ("FPC_X_RETRIES", 0),
++           fpc_x_env ("FPC_X_RETRY_MS", 500),
++           fpc_x_env ("FPC_X_NODUP", 0));
++
+   self->enroll_stage = 0;
+   self->immobile_stage = 0;
++  self->x_retry_count = 0;
++  self->x_drain_count = 0;
+   self->enroll_ssm = fpi_ssm_new_full (device, fpc_enroll_sm_run_state,
+                                        FP_ENROLL_NUM_STATES,
+                                        FP_ENROLL_DISCARD,
+@@ -1746,6 +2072,26 @@
+   dev_class->resume =           fpc_dev_resume;
+   dev_class->cancel =           fpc_dev_cancel;
+ 
++  /* EXPERIMENT (patches/0005): fprintd runs an identify -- and therefore a
++   * full image capture -- immediately before every enroll, which is exactly
++   * what leaves the a900 unable to re-arm. The gate is
++   * FP_DEVICE_FEATURE_IDENTIFY, NOT FP_DEVICE_FEATURE_DUPLICATES_CHECK:
++   * fprintd 1.94.3 src/device.c, fprint_device_enroll_start, reads
++   *
++   *     if (fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_IDENTIFY))
++   *       { ... fp_device_identify (priv->dev, all_prints, ...); }
++   *
++   * and it runs that pass even when the gallery is empty. Measured: clearing
++   * DUPLICATES_CHECK on its own changes nothing.
++   *
++   * fpi_device_class_auto_initialize_features() derives the flag from
++   * dev_class->identify being set, so clearing the vfunc first is what drops
++   * it, and keeps the advertised feature set self-consistent. Verification is
++   * unaffected -- fprintd falls back to fp_device_verify(), and this driver
++   * points ->verify and ->identify at the same function. */
++  if (fpc_x_env ("FPC_X_NODUP", 0))
++    dev_class->identify = NULL;
++
+   fpi_device_class_auto_initialize_features (dev_class);
+   dev_class->features |= FP_DEVICE_FEATURE_DUPLICATES_CHECK;
+ }

@@ -1,0 +1,70 @@
+DEBUG ONLY (do not ship): log TEE/enclave results, read the 12th record
+
+Two things, both diagnostic:
+
+1. The driver discards the result of fpc_tee_enroll() and every
+   fpc_enclave_process_data() call, so an enrollment whose samples are all
+   being rejected still reports "enroll-stage-passed" eleven times and
+   "enroll-completed". This logs what they actually return.
+
+2. (Removed again.) Routing the twelfth record through
+   sm_wait4img()/fpc_ssm_img_read_cb() instead of patch 0006's own reader was
+   tested: fpc_enclave_process_data() returns -1 on that record either way, so
+   the rejection is a property of the record and the blob, not of the reader.
+   Patch 0006 keeps its own reader, which is bounded by a timeout and so cannot
+   hang on a device that sends only eleven.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -309,7 +309,8 @@
+ 
+   if (self->rem_received_len >= self->rem_expect_len)
+     {
+-      fpc_enclave_process_data (self->dev_ctx->enclave);
++      fp_info ("DBG: enclave_process_data (trailing) -> %d",
++               fpc_enclave_process_data (self->dev_ctx->enclave));
+       self->rem_expect_len = 0;
+       self->rem_received_len = 0;
+     }
+@@ -498,11 +499,14 @@
+     {
+       received_len = 0;
+       expect_len = 0;
+-      fpc_enclave_process_data (self->dev_ctx->enclave);
++      fp_info ("DBG: enclave_process_data (deadpix) -> %d",
++               fpc_enclave_process_data (self->dev_ctx->enclave));
+ 
+       if (self->enroll_count++ < MAX_ENROLL_SAMPLES)
+         {
+           result = fpc_tee_enroll (self->dev_ctx->bio, &remaining_samples);
++          fp_info ("DBG: fpc_tee_enroll #%u -> result %d, remaining %u",
++                   self->enroll_count, result, remaining_samples);
+           fpi_device_enroll_progress (device, self->enroll_count, NULL, NULL);
+           /* patches/0005: go via the FP_ENROLL_X_* recovery states rather than
+            * straight to FP_ENROLL_CAPTURE, so whatever clears the post-capture
+@@ -653,7 +657,8 @@
+     {
+       received_len = 0;
+       expect_len = 0;
+-      fpc_enclave_process_data (self->dev_ctx->enclave);
++      fp_info ("DBG: enclave_process_data (img) -> %d",
++               fpc_enclave_process_data (self->dev_ctx->enclave));
+       fpi_ssm_next_state (transfer->ssm);
+     }
+   else
+@@ -833,6 +838,7 @@
+       {
+         self->enroll_count = 0;
+         result = fpc_tee_load_empty_db (self->dev_ctx->bio);
++        fp_info ("DBG: fpc_tee_load_empty_db -> %d", result);
+         if (result)
+           {
+             fp_err ("%s, fpc_tee_load_empty_db failed %d", G_STRFUNC, result);
+@@ -841,6 +847,7 @@
+           }
+ 
+         result = fpc_tee_begin_enroll (self->dev_ctx->bio);
++        fp_info ("DBG: fpc_tee_begin_enroll -> %d", result);
+         if (result)
+           {
+             fp_err ("%s, begin enroll failed %d", G_STRFUNC, result);

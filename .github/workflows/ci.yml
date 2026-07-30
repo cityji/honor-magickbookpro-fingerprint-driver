@@ -1,0 +1,134 @@
+name: build
+
+# Proves two things on every change: that the patch set still applies to
+# upstream libfprint + merge request 396, and that the result compiles and
+# contains the a900.
+#
+# The proprietary matcher (libfpcbep.so) cannot be published, so CI links
+# against a generated stub -- see build.sh, STUB_BLOB. The stub only satisfies
+# the linker; the artifact still records DT_NEEDED libfpcbep.so and loads the
+# real library at run time.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            required: true
+          - runner: ubuntu-22.04
+            required: false
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ !matrix.required }}
+    name: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git curl unzip meson ninja-build gcc g++ pkg-config python3 \
+            libglib2.0-dev libgusb-dev libnss3-dev libusb-1.0-0-dev \
+            libpixman-1-dev libgudev-1.0-dev libjson-glib-dev binutils
+
+      - name: Build (stub matcher)
+        run: STUB_BLOB=1 ./build.sh
+
+      - name: Check the artifact
+        run: |
+          set -e
+          LIB=dist/libfprint-2.so.2.0.0
+          test -f "$LIB"
+          echo "size: $(stat -c %s "$LIB") bytes"
+
+          # DT_NEEDED must name the real matcher, not the stub path.
+          objdump -p "$LIB" | awk '/NEEDED/ && /libfpcbep\.so/ {f=1} END {exit !f}'
+          echo "DT_NEEDED libfpcbep.so   : ok"
+
+          # The driver and both device ids.
+          strings -a "$LIB" | awk '$0=="FPC MOH Fingerprint Sensor" {f=1} END {exit !f}'
+          echo "fpcmoh driver present    : ok"
+
+          python3 - "$LIB" <<'EOF'
+          import sys
+          d = open(sys.argv[1],'rb').read()
+          for pid, name in ((0x9800,'10a5:9800'), (0xa900,'10a5:a900')):
+              e = pid.to_bytes(4,'little') + (0x10a5).to_bytes(4,'little')
+              assert d.count(e), "missing id_table entry for " + name
+              print("id_table %-12s: ok" % name)
+          EOF
+
+          # The a900 fixes must actually be compiled in, not merely applied.
+          # These strings come from patches 0006, 0009 and 0010.
+          for s in "sensor has nothing further to send" \
+                   "opened a %u byte gap at offset %u" \
+                   "matcher rejected %u samples in a row"; do
+            strings -a "$LIB" | awk -v s="$s" 'index($0,s) {f=1} END {exit !f}' \
+              || { echo "MISSING from the build: $s"; exit 1; }
+            echo "compiled in              : $s"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libfprint-fpcmoh-a900-${{ matrix.runner }}
+          path: |
+            dist/libfprint-2.so.2.0.0
+          if-no-files-found: error
+          retention-days: 14
+
+  patches:
+    runs-on: ubuntu-24.04
+    name: patch hygiene
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every patch applies on its own, in order
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends git curl ca-certificates
+          git clone --depth 1 --branch v1.94.6 \
+            https://gitlab.freedesktop.org/libfprint/libfprint.git /tmp/lf
+          curl -fsSL -o /tmp/mr396.patch \
+            https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/396.patch
+          git -C /tmp/lf apply --check /tmp/mr396.patch
+          git -C /tmp/lf apply /tmp/mr396.patch
+          for p in "$PWD"/patches/*.patch; do
+            echo "-- $(basename "$p")"
+            git -C /tmp/lf apply --check "$p"
+            git -C /tmp/lf apply "$p"
+          done
+          echo "all patches apply cleanly, in order"
+
+      - name: Debug patches apply on top
+        run: |
+          set -e
+          for p in "$PWD"/patches-debug/0007*.patch "$PWD"/patches-debug/0008*.patch; do
+            echo "-- $(basename "$p")"
+            git -C /tmp/lf apply --check "$p" || {
+              echo "note: $(basename "$p") no longer applies -- it is diagnostic only"
+              exit 0
+            }
+            git -C /tmp/lf apply "$p"
+          done
+
+  shell:
+    runs-on: ubuntu-24.04
+    name: shellcheck
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y shellcheck
+      - run: shellcheck -S warning ./*.sh tools/*.sh
