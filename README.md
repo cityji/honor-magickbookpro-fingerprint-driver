@@ -1,4 +1,9 @@
 # Fingerprint driver for `10a5:a900` — HONOR MagicBook and other FPC match-on-host sensors
+##tags
+libfprint-2-tod1-fpc-a900
+honor-fingerprint-driver
+libfprint-a900
+
 
 [![build](https://github.com/cityji/honor-magickbookpro-fingerprint-driver/actions/workflows/ci.yml/badge.svg)](https://github.com/cityji/honor-magickbookpro-fingerprint-driver/actions/workflows/ci.yml)
 
