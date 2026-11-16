@@ -1,0 +1,56 @@
+fpcmoh: do not hand the same GError to the SSM and the suspend task
+
+fpc_enroll_suspend_resume_cb() and fpc_verify_suspend_resume_cb() pass the
+transfer's GError to both fpi_ssm_mark_failed() and
+fpi_device_suspend_complete()/fpi_device_resume_complete(). Both take
+ownership: mark_failed() stores the pointer in machine->error (freed by
+fpi_ssm_free()), while suspend_complete() steals it into priv->suspend_error
+and resume_complete() returns it via g_task_return_error(). When a transfer
+fails while the device is suspended, the same GError is freed twice.
+
+Give the SSM a copy and let the suspend/resume completion consume the
+original, matching how the merged fpcmoc driver handles this case.
+
+Latent cousin of the bug fixed by patch 0004; not yet observed in the wild
+(the sleep-hook restart usually tears the daemon down first). Not
+a900-specific.
+
+Applies on top of merge request 396 + patches 0001-0011.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -1049,7 +1049,7 @@
+   if (ssm_state == FP_ENROLL_SUSPENDED)
+     {
+       if (error)
+-        fpi_ssm_mark_failed (transfer->ssm, error);
++        fpi_ssm_mark_failed (transfer->ssm, g_error_copy (error));
+ 
+       fpi_device_suspend_complete (device, error);
+       /* The resume handler continues to the next state! */
+@@ -1057,7 +1057,7 @@
+   else if (ssm_state == FP_ENROLL_RESUME)
+     {
+       if (error)
+-        fpi_ssm_mark_failed (transfer->ssm, error);
++        fpi_ssm_mark_failed (transfer->ssm, g_error_copy (error));
+       else
+         fpi_ssm_jump_to_state (transfer->ssm, FP_ENROLL_CAPTURE);
+ 
+@@ -1573,14 +1573,14 @@
+   if (ssm_state == FP_VERIFY_SUSPENDED)
+     {
+       if (error)
+-        fpi_ssm_mark_failed (transfer->ssm, error);
++        fpi_ssm_mark_failed (transfer->ssm, g_error_copy (error));
+ 
+       fpi_device_suspend_complete (device, error);
+     }
+   else if (ssm_state == FP_VERIFY_RESUME)
+     {
+       if (error)
+-        fpi_ssm_mark_failed (transfer->ssm, error);
++        fpi_ssm_mark_failed (transfer->ssm, g_error_copy (error));
+       else
+         fpi_ssm_jump_to_state (transfer->ssm, FP_VERIFY_CAPTURE);
+ 
