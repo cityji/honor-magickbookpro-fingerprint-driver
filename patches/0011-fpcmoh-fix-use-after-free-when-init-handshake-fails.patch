@@ -1,0 +1,79 @@
+fpcmoh: fix use-after-free when the init handshake fails (crashes fprintd with SIGSEGV)
+
+fpi_ssm_mark_failed() completes the state machine synchronously: it runs the
+completion callback and then fpi_ssm_free() frees the SSM (fpi-ssm.c,
+fpi_ssm_mark_completed). Two init transfer callbacks fall through to
+fpi_ssm_next_state() after marking failure, operating on freed memory:
+
+    fpi_ssm_hello_receive_cb: enter
+    fpc_hello_evt_handler: cmd id error 6
+    BUG: (machine->completed): fpi_ssm_next_state() ../libfprint/fpi-ssm.c:456
+    fprintd[...]: segfault at 7fdec9931884 ... in libfprint-2.so.2.0.0
+
+    #0 FP_IS_DEVICE
+    #1 __ssm_call_handler
+    #2 fpi_ssm_hello_receive_cb
+    #3 transfer_finish_cb
+
+Observed three times on FPC 10a5:a900 (Honor MagicBook Art 14, FW 22.26.2.43),
+each time right after resume: the sensor answers the first TLS-hello bulk read
+with a stale event (cmdid 6 instead of 5) left over from the session that
+suspend interrupted. fpc_hello_evt_handler() returns -1, the SSM is freed, and
+the fall-through next_state() dereferences it. fpc_cmd_init_cb() has the same
+missing return on its failure path.
+
+Return immediately after fpi_ssm_mark_failed() in both callbacks. The open
+then fails cleanly through fpc_init_ssm_done() and fprintd's caller can retry;
+the retry's USB reset clears the sensor's stale event.
+
+Also drop the error override in fpc_init_ssm_done(): it adopts the SSM's own
+error pointer and hands it to the (transfer full) fpi_device_open_complete(),
+so the original is freed twice -- once via the GTask, once by fpi_ssm_free().
+This is the same bug patch 0004 fixed in fpc_enroll_ssm_done() and
+fpc_verify_ssm_done(); the init completion handler was missed. It fires on the
+very same failure path, corrupting the heap right before the use-after-free
+above.
+
+Not a900-specific: any FPC MoH device whose init handshake fails takes fprintd
+down with it.
+
+Applies on top of merge request 396 + patches 0001-0010.
+---
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -1939,6 +1939,7 @@
+     {
+       fpi_ssm_mark_failed (transfer->ssm,
+                            fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++      return;
+     }
+ 
+   fpi_ssm_next_state (transfer->ssm);
+@@ -1991,8 +1992,11 @@
+   int ret = fpc_init_evt_handler (device, transfer->buffer, transfer->actual_length);
+ 
+   if (ret)
+-    fpi_ssm_mark_failed (transfer->ssm,
+-                         fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++    {
++      fpi_ssm_mark_failed (transfer->ssm,
++                           fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++      return;
++    }
+ 
+   fpi_ssm_next_state (transfer->ssm);
+ }
+@@ -2131,8 +2135,11 @@
+ {
+   FpiDeviceFpcMoh *self = FPI_DEVICE_FPCMOH (dev);
+ 
+-  if (fpi_ssm_get_error (ssm))
+-    error = fpi_ssm_get_error (ssm);
++  /* NB: do not overwrite `error` with fpi_ssm_get_error(). libfprint already
++   * passed us an owned copy of the SSM error; fpi_ssm_get_error() returns the
++   * SSM's original, which fpi_ssm_free() frees. Adopting it here would leak the
++   * copy and then double-free the original via the (transfer full)
++   * fpi_device_open_complete(). */
+ 
+   fpi_device_open_complete (dev, error);
+   self->task_ssm = NULL;

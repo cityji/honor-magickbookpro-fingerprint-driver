@@ -109,8 +109,10 @@ systemctl restart fprintd 2>/dev/null || true
 
 echo
 echo "FINISHED. Verify the right library is actually loaded:"
-echo "  fprintd-enroll \$USER & sleep 2; sudo grep -E 'fpc-a900|libfpcbep' /proc/\$(pidof fprintd)/maps"
+echo "  fprintd-enroll \$USER & EPID=\$!; sleep 2; sudo grep -E 'fpc-a900|libfpcbep' /proc/\$(pidof fprintd)/maps; kill \$EPID"
 echo
 echo "Then enroll (in a DESKTOP terminal -- needs a polkit agent):"
 echo "  fprintd-enroll \$USER"
+echo "NB: a running fprintd-enroll holds the device claim -- while it runs,"
+echo "    lock-screen fingerprint unlock is blocked. Finish or Ctrl-C it."
 echo "To remove:    sudo ./uninstall.sh"
